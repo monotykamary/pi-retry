@@ -1,0 +1,46 @@
+{
+  "name": "pi-retry",
+  "version": "0.1.0",
+  "description": "Extension for pi coding agent that handles 400/413 errors with pure retry (no compaction)",
+  "type": "module",
+  "author": "Tom X Nguyen",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/monotykamary/pi-retry.git"
+  },
+  "homepage": "https://github.com/monotykamary/pi-retry#readme",
+  "bugs": {
+    "url": "https://github.com/monotykamary/pi-retry/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "retry",
+    "error-handling",
+    "http-400",
+    "http-413",
+    "cli"
+  ],
+  "files": [
+    "*.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*",
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2"
+  },
+  "pi": {
+    "extensions": [
+      "./retry-400-413.ts"
+    ]
+  }
+}
