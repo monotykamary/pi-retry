@@ -79,6 +79,7 @@ export default function (pi: ExtensionAPI) {
     if (lastMsg?.role === "assistant" && lastMsg.stopReason !== "error") {
       customRetryAttempt = 0;
       isCustomRetrying = false;
+      ctx.ui.setStatus("retry-400-413", undefined); // Clear the status
     }
   });
 
