@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
-  "ignore": ["**/__tests__/helpers.ts", "**/*.test.ts", "src/index.ts"],
+  "ignore": ["**/__tests__/helpers.ts", "src/index.ts"],
   "ignoreExportsUsedInFile": true,
   "entry": [
     "retry-400-413.ts",
