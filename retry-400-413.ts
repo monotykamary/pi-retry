@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { TextContent, ImageContent } from "@mariozechner/pi-ai";
 
 /**
  * Retry extension for handling 400/413 errors WITHOUT compaction
@@ -10,22 +9,32 @@ import type { TextContent, ImageContent } from "@mariozechner/pi-ai";
  * 
  * WARNING: Retrying 400/413 without compaction may fail repeatedly
  * if the context is genuinely too large. Use with caution.
+ * 
+ * Features:
+ * - Indefinite retry (until success or user abort)
+ * - Exponential backoff with cap (max 60s between retries)
+ * - Hidden retry triggers (no TUI clutter)
  */
 
 // Track retry state
 let customRetryAttempt = 0;
 let isCustomRetrying = false;
-const MAX_CUSTOM_RETRIES = 3;
-const CUSTOM_RETRY_DELAY_MS = 2000;
+let lastErrorMessage = "";
 
-// Type guard to check if message is an AssistantMessage with error properties
-function isAssistantWithError(message: AgentMessage): message is Extract<AgentMessage, { role: "assistant" }> {
+// Configuration
+const BASE_DELAY_MS = 2000;        // Start with 2 seconds
+const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
+const BACKOFF_MULTIPLIER = 2;      // Double each time
+const RETRY_CUSTOM_TYPE = "__retry_400_413_trigger";
+
+// Type guard to check if message is an AssistantMessage
+function isAssistantMessage(message: AgentMessage): message is Extract<AgentMessage, { role: "assistant" }> {
   return message.role === "assistant";
 }
 
 // Check if message has 400 or 413 error
 function has400or413Error(message: AgentMessage): boolean {
-  if (!isAssistantWithError(message)) return false;
+  if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
   
   // Match 400 or 413 status codes (commonly from Cerebras or other providers)
@@ -46,44 +55,44 @@ function getLastAssistantMessage(entries: unknown[]): AgentMessage | undefined {
   return undefined;
 }
 
-// Type guard for user message with content
-function isUserMessageWithContent(message: AgentMessage): message is Extract<AgentMessage, { role: "user" }> & { content: (TextContent | ImageContent)[] | string } {
-  return message.role === "user" && "content" in message;
+// Calculate delay with exponential backoff and cap
+function calculateDelay(attempt: number): number {
+  const delay = BASE_DELAY_MS * Math.pow(BACKOFF_MULTIPLIER, attempt - 1);
+  return Math.min(delay, MAX_DELAY_MS);
 }
 
-// Type guard for text content
-function isTextContent(c: TextContent | ImageContent | unknown): c is { type: "text"; text: string } {
-  return typeof c === "object" && c !== null && "type" in c && c.type === "text" && "text" in c;
-}
-
-// Extract text content from message content array
-function extractTextContent(content: (TextContent | ImageContent)[] | string | undefined): string {
-  if (!content) return "";
-  if (typeof content === "string") return content;
-  return content
-    .filter(isTextContent)
-    .map(c => c.text)
-    .join("");
-}
-
-// Exponential backoff sleep
+// Sleep helper
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Format duration for display
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(ms / 60000);
+  const seconds = ((ms % 60000) / 1000).toFixed(0);
+  return `${minutes}m ${seconds}s`;
+}
+
 export default function (pi: ExtensionAPI) {
-  
+  let pendingRetryCleanup = false;
+
   // Reset retry counter on successful completion
-  pi.on("agent_end", async (event, ctx) => {
-    const lastMsg = event.messages[event.messages.length - 1];
-    if (lastMsg?.role === "assistant" && lastMsg.stopReason !== "error") {
+  pi.on("turn_end", async (event, ctx) => {
+    const msg = event.message as any;
+    if (msg.role === "assistant" && msg.stopReason !== "error" && msg.stopReason !== "aborted") {
+      if (customRetryAttempt > 0) {
+        ctx.ui.notify(`400/413 retry succeeded after ${customRetryAttempt} attempt(s).`, "success");
+        ctx.ui.setStatus("retry-400-413", undefined);
+      }
       customRetryAttempt = 0;
       isCustomRetrying = false;
-      ctx.ui.setStatus("retry-400-413", undefined); // Clear the status
+      lastErrorMessage = "";
     }
   });
 
-  // Intercept agent_end to handle 400/413 errors - PURE RETRY, NO COMPACTION
+  // Intercept agent_end to handle 400/413 errors - PURE RETRY, NO COMPACTION, INFINITE
   pi.on("agent_end", async (event, ctx) => {
     // Prevent recursive retry loops
     if (isCustomRetrying) return;
@@ -95,64 +104,49 @@ export default function (pi: ExtensionAPI) {
       return; // Not a 400/413 error - let normal flow continue
     }
 
-    // 400/413 detected - retry without compaction
-    // We know it's an assistant message with error from has400or413Error check
-    const errorMsg = isAssistantWithError(lastAssistant) && lastAssistant.errorMessage 
+    // 400/413 detected - retry without compaction (indefinitely)
+    const errorMsg = isAssistantMessage(lastAssistant) && lastAssistant.errorMessage 
       ? lastAssistant.errorMessage 
       : "Unknown error";
     
-    ctx.ui.notify(`400/413 error detected: ${errorMsg}`, "warning");
+    lastErrorMessage = errorMsg;
+    isCustomRetrying = true;
+    customRetryAttempt++;
+    
+    const delay = calculateDelay(customRetryAttempt);
+    
+    ctx.ui.notify(`400/413 error (attempt ${customRetryAttempt}): ${errorMsg.substring(0, 100)}`, "warning");
+    ctx.ui.setStatus("retry-400-413", `400/413 retry in ${formatDuration(delay)} (attempt ${customRetryAttempt})...`);
+    
+    await sleep(delay);
+    
+    // Trigger retry using hidden message
+    triggerRetry(pi);
+    
+    isCustomRetrying = false;
+  });
 
-    if (customRetryAttempt < MAX_CUSTOM_RETRIES) {
-      isCustomRetrying = true;
-      customRetryAttempt++;
-      const delay = CUSTOM_RETRY_DELAY_MS * Math.pow(2, customRetryAttempt - 1);
-      
-      ctx.ui.notify(`Retrying ${customRetryAttempt}/${MAX_CUSTOM_RETRIES} in ${delay}ms (no compaction)...`, "info");
-      ctx.ui.setStatus("retry-400-413", `Retrying (${customRetryAttempt}/${MAX_CUSTOM_RETRIES})...`);
-      
-      await sleep(delay);
-      
-      // Trigger a retry by sending a follow-up message
-      // This causes the agent to retry the last user prompt
-      const branch = ctx.sessionManager.getBranch();
-      const lastUserMsg = branch
-        .slice()
-        .reverse()
-        .find(e => e.type === "message" && e.message?.role === "user");
-      
-      if (lastUserMsg && lastUserMsg.type === "message" && isUserMessageWithContent(lastUserMsg.message)) {
-        const userText = extractTextContent(lastUserMsg.message.content);
-        
-        if (userText) {
-          // Re-send the last user message to trigger a retry
-          pi.sendUserMessage(userText, { deliverAs: "followUp" });
-          ctx.ui.notify("Retry triggered", "info");
-        }
-      }
-      
-      isCustomRetrying = false;
-    } else {
-      ctx.ui.notify(`Max retries (${MAX_CUSTOM_RETRIES}) exceeded`, "error");
-      ctx.ui.setStatus("retry-400-413", "Failed - max retries exceeded");
-      customRetryAttempt = 0;
-      isCustomRetrying = false;
+  // Monitor message_end for 400/413 errors (additional visibility)
+  pi.on("message_end", async (event, ctx) => {
+    const msg = event.message;
+    if (msg.role === "assistant" && has400or413Error(msg)) {
+      ctx.ui.setStatus("retry-400-413", "400/413 detected - will retry...");
     }
   });
 
-  // Alternative: Handle via message_end for more granular control
-  pi.on("message_end", async (event, ctx) => {
-    const msg = event.message;
-    if (msg.role === "assistant" && 
-        msg.stopReason === "error" && 
-        has400or413Error(msg)) {
-      
-      // Could modify the error message or add context here
-      ctx.ui.setStatus("retry-ext", "400/413 detected - handling...");
-      
-      // Clear status after a moment
-      setTimeout(() => ctx.ui.setStatus("retry-ext", undefined), 5000);
-    }
+  // Clean up hidden retry triggers from context
+  pi.on("context", async (event) => {
+    if (!pendingRetryCleanup) return;
+    pendingRetryCleanup = false;
+
+    const cleaned = event.messages.filter((msg: any) => {
+      if (msg.role === "custom" && msg.customType === RETRY_CUSTOM_TYPE) {
+        return false;
+      }
+      return true;
+    });
+
+    return { messages: cleaned };
   });
 
   // Register a command to manually retry the last failed request
@@ -167,47 +161,62 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      ctx.ui.notify("Manually retrying (no compaction)...", "info");
+      ctx.ui.notify("Manually retrying 400/413 (no compaction)...", "info");
       
-      // Reset attempt counter and trigger immediate retry
+      // Reset attempt counter for manual retry
       customRetryAttempt = 0;
-      
-      // Find last user message and resend it
-      const branch = ctx.sessionManager.getBranch();
-      const lastUserMsg = branch
-        .slice()
-        .reverse()
-        .find(e => e.type === "message" && e.message?.role === "user");
-      
-      if (lastUserMsg && lastUserMsg.type === "message" && isUserMessageWithContent(lastUserMsg.message)) {
-        const userText = extractTextContent(lastUserMsg.message.content);
-        
-        if (userText) {
-          pi.sendUserMessage(userText, { deliverAs: "followUp" });
-        }
-      }
+      triggerRetry(pi);
     }
   });
 
-  // Register a command to configure retry settings
+  // Register a command to show/configure retry settings
   pi.registerCommand("retry-config", {
-    description: "Show/configure 400/413 retry settings",
+    description: "Show/reset 400/413 retry settings",
     handler: async (args, ctx) => {
       if (args.includes("reset")) {
         customRetryAttempt = 0;
+        isCustomRetrying = false;
+        lastErrorMessage = "";
+        ctx.ui.setStatus("retry-400-413", undefined);
         ctx.ui.notify("Retry counter reset", "info");
         return;
       }
       
-      ctx.ui.notify(
-        `Max retries: ${MAX_CUSTOM_RETRIES}, Base delay: ${CUSTOM_RETRY_DELAY_MS}ms, Current attempt: ${customRetryAttempt}`,
-        "info"
-      );
+      const entries = ctx.sessionManager.getEntries();
+      const lastAssistant = getLastAssistantMessage(entries);
+      
+      let status = `Current retry attempt: ${customRetryAttempt}\n`;
+      status += `Is retrying: ${isCustomRetrying}\n`;
+      status += `Last error: ${lastErrorMessage || "None"}\n`;
+      status += `Base delay: ${BASE_DELAY_MS}ms, Max delay: ${MAX_DELAY_MS}ms\n`;
+      
+      if (lastAssistant && isAssistantMessage(lastAssistant)) {
+        status += `\nLast assistant stop reason: ${lastAssistant.stopReason}\n`;
+        status += `Last error message: ${lastAssistant.errorMessage || "None"}\n`;
+        status += `Is 400/413 error: ${has400or413Error(lastAssistant)}`;
+      }
+      
+      ctx.ui.notify(status, "info");
     }
   });
 
   // Initialize
   pi.on("session_start", async () => {
     customRetryAttempt = 0;
+    isCustomRetrying = false;
+    lastErrorMessage = "";
   });
+
+  // Helper: send the hidden retry trigger
+  function triggerRetry(pi: ExtensionAPI) {
+    pendingRetryCleanup = true;
+    pi.sendMessage(
+      {
+        customType: RETRY_CUSTOM_TYPE,
+        content: "Retrying 400/413.",
+        display: false,
+      },
+      { triggerTurn: true },
+    );
+  }
 }

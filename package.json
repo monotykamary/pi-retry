@@ -1,7 +1,7 @@
 {
   "name": "pi-retry",
-  "version": "0.1.0",
-  "description": "Extension for pi coding agent that handles 400/413 errors with pure retry (no compaction)",
+  "version": "0.2.0",
+  "description": "Extension suite for pi coding agent that handles 400/413 errors and connection errors with automatic retry",
   "type": "module",
   "author": "Tom X Nguyen",
   "license": "MIT",
@@ -22,6 +22,9 @@
     "error-handling",
     "http-400",
     "http-413",
+    "connection-error",
+    "network-error",
+    "infinite-retry",
     "cli"
   ],
   "files": [
@@ -40,7 +43,8 @@
   },
   "pi": {
     "extensions": [
-      "./retry-400-413.ts"
+      "./retry-400-413.ts",
+      "./retry-connection.ts"
     ]
   }
 }
