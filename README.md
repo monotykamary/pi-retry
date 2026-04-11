@@ -59,6 +59,42 @@ Handles connection/network errors with **indefinite retry** and capped exponenti
 - `TLS handshake error`
 - And more...
 
+## Development
+
+### Running Tests
+
+```bash
+# Run all tests
+npm test
+
+# Run tests in watch mode
+npm run test:watch
+
+# Run tests with coverage
+npm run test:coverage
+
+# Type check
+npm run typecheck
+```
+
+### Project Structure
+
+```
+.
+├── retry-400-413.ts          # 400/413 error retry extension
+├── retry-connection.ts        # Connection error retry extension
+├── src/                       # Shared utilities (testable)
+│   ├── error-patterns.ts      # Error pattern matching
+│   ├── retry-logic.ts         # Retry logic utilities
+│   └── index.ts               # Module exports
+├── __tests__/                 # Test suite
+│   ├── helpers.ts             # Test utilities
+│   └── unit/                  # Unit tests
+│       ├── error-patterns.test.ts
+│       └── retry-logic.test.ts
+└── vitest.config.ts           # Test configuration
+```
+
 ## Installation
 
 ### Option 1: Install via pi package (Recommended)

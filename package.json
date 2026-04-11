@@ -29,9 +29,13 @@
   ],
   "files": [
     "*.ts",
+    "src/",
     "README.md"
   ],
   "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
@@ -39,7 +43,9 @@
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*",
     "@types/node": "^25.5.0",
-    "typescript": "^6.0.2"
+    "@vitest/coverage-v8": "^4.1.4",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4"
   },
   "pi": {
     "extensions": [
