@@ -83,16 +83,26 @@ npm run typecheck
 .
 ├── retry-400-413.ts          # 400/413 error retry extension
 ├── retry-connection.ts        # Connection error retry extension
-├── src/                       # Shared utilities (testable)
-│   ├── error-patterns.ts      # Error pattern matching
-│   ├── retry-logic.ts         # Retry logic utilities
-│   └── index.ts               # Module exports
-├── __tests__/                 # Test suite
+├── src/                       # Shared utilities (testable, DRY)
+│   ├── error-patterns.ts      # Error pattern matching (19 connection, 3 400/413 patterns)
+│   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, etc.)
+│   └── index.ts               # Barrel exports for consumers
+├── __tests__/                 # Comprehensive test suite (94 tests)
 │   ├── helpers.ts             # Test utilities
 │   └── unit/                  # Unit tests
 │       ├── error-patterns.test.ts
 │       └── retry-logic.test.ts
-└── vitest.config.ts           # Test configuration
+├── vitest.config.ts           # Test configuration
+└── knip.json                  # Dead code detection config
+```
+
+### Code Quality
+
+```bash
+# Run all quality checks
+npm test              # 94 unit tests
+npm run typecheck     # TypeScript type checking
+npm run lint:dead     # Dead code detection with knip
 ```
 
 ## Installation

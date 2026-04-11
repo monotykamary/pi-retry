@@ -3,6 +3,10 @@
  */
 
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { calculateDelay as _calculateDelay, formatDuration as _formatDuration } from "./retry-logic.js";
+
+// Re-export retry utilities from error-patterns for convenience
+export { _calculateDelay as calculateDelay, _formatDuration as formatDuration };
 
 // 400/413 error patterns
 const ERROR_400_413_PATTERNS = [
@@ -92,3 +96,6 @@ export function getErrorCategory(errorMessage: string): '400-413' | 'connection'
   if (BUILTIN_HANDLED_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   return 'other';
 }
+
+// Re-export getLastAssistantMessage for convenience
+export { getLastAssistantMessage } from './retry-logic.js';

@@ -36,14 +36,16 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint:dead": "knip --no-gitignore"
   },
   "devDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*",
     "@types/node": "^25.5.0",
     "@vitest/coverage-v8": "^4.1.4",
+    "knip": "^6.4.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.4"
   },
