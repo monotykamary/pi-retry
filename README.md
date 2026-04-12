@@ -1,109 +1,34 @@
-# pi-retry Extension Suite
+# pi-retry Extension
 
-Extensions for the [pi coding agent](https://github.com/badlogic/pi) that provide comprehensive retry handling for various error types.
+Unified retry extension for the [pi coding agent](https://github.com/badlogic/pi) that provides comprehensive automatic retry handling for 400/413 errors and connection errors.
 
-## Extensions
+## Overview
 
-This package contains two complementary extensions:
+This extension automatically detects and retries:
 
-| Extension | Handles | Retry Behavior | Use Case |
-|-----------|---------|----------------|----------|
-| `retry-400-413.ts` | HTTP 400/413 errors | **Indefinite** with capped backoff, NO compaction | Context overflow that might be transient |
-| `retry-connection.ts` | Connection/network errors | **Indefinite** with capped backoff | Network hiccups, connection drops |
+| Error Type | Retry Behavior | Use Case |
+|------------|----------------|----------|
+| HTTP 400/413 | **Indefinite** with capped backoff, NO compaction | Transient context overflow that might resolve |
+| Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors |
 
 ## Problem
 
 By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded), but:
 
 1. **400/413 errors** are treated as context overflow → triggers compaction but NO retry
-2. **Connection errors** sometimes get only 3 retries before giving up
+2. **Connection errors** sometimes get only limited retries before giving up
 3. Some transient network errors aren't retried at all
 
-## Solutions
+## Solution
 
-### retry-400-413.ts
-
-Handles `400 Bad Request` and `413 Payload Too Large` errors by retrying WITHOUT compaction.
-
-**⚠️ Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large. Use this if:
-- The error is transient (provider glitch)
-- You want to retry before attempting compaction
-- You're testing provider behavior
+This extension provides **automatic** infinite retry with sensible exponential backoff (2s → 4s → 8s → ... → 60s max).
 
 **Features:**
-- Automatic detection of 400/413 errors
+- Automatic detection of 400/413 and connection errors
 - **Indefinite retry** — Keeps retrying until success
-- Exponential backoff with cap: 2s → 4s → 8s → ... → 60s max
+- Exponential backoff with cap: max 60s between retries
 - Hidden retry triggers (no TUI clutter)
-- Manual retry command (`/retry-413`)
-
-### retry-connection.ts
-
-Handles connection/network errors with **indefinite retry** and capped exponential backoff.
-
-**Features:**
-- Retries indefinitely until success (or user abort)
-- Exponential backoff with 60-second cap: 2s → 4s → 8s → ... → 60s max
-- Covers: "Connection error", network timeouts, socket errors, DNS failures, etc.
-- Hidden retry triggers (no TUI clutter)
-- Manual controls via commands
-
-**Detected error patterns:**
-- `Connection error`
-- `Network error`
-- `Fetch failed`
-- `Socket hang up` / `Socket error`
-- `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`
-- `Request ended without sending any chunks`
-- `Upstream connect error`
-- `TLS handshake error`
-- And more...
-
-## Development
-
-### Running Tests
-
-```bash
-# Run all tests
-npm test
-
-# Run tests in watch mode
-npm run test:watch
-
-# Run tests with coverage
-npm run test:coverage
-
-# Type check
-npm run typecheck
-```
-
-### Project Structure
-
-```
-.
-├── retry-400-413.ts          # 400/413 error retry extension
-├── retry-connection.ts        # Connection error retry extension
-├── src/                       # Shared utilities (testable, DRY)
-│   ├── error-patterns.ts      # Error pattern matching (19 connection, 3 400/413 patterns)
-│   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, etc.)
-│   └── index.ts               # Barrel exports for consumers
-├── __tests__/                 # Comprehensive test suite (94 tests)
-│   ├── helpers.ts             # Test utilities
-│   └── unit/                  # Unit tests
-│       ├── error-patterns.test.ts
-│       └── retry-logic.test.ts
-├── vitest.config.ts           # Test configuration
-└── knip.json                  # Dead code detection config
-```
-
-### Code Quality
-
-```bash
-# Run all quality checks
-npm test              # 94 unit tests
-npm run typecheck     # TypeScript type checking
-npm run lint:dead     # Dead code detection with knip
-```
+- Manual controls via unified `/retry` command
 
 ## Installation
 
@@ -127,15 +52,10 @@ Or add to your `settings.json`:
 
 ### Option 2: Global Installation
 
-Copy the extensions to pi's global extensions directory:
+Copy the extension to pi's global extensions directory:
 
 ```bash
-# Install both
-cp retry-400-413.ts ~/.pi/agent/extensions/
-cp retry-connection.ts ~/.pi/agent/extensions/
-
-# Or install just one
-cp retry-connection.ts ~/.pi/agent/extensions/
+cp retry.ts ~/.pi/agent/extensions/
 ```
 
 ### Option 3: Project-Local Installation
@@ -144,65 +64,38 @@ Copy to your project's `.pi/extensions/` directory:
 
 ```bash
 mkdir -p .pi/extensions
-cp retry-400-413.ts .pi/extensions/
-cp retry-connection.ts .pi/extensions/
+cp retry.ts .pi/extensions/
 ```
 
 ### Option 4: Quick Test
 
 ```bash
-# Test individual extension
-pi -e ./retry-connection.ts
-
-# Or both
-pi -e ./retry-400-413.ts -e ./retry-connection.ts
+pi -e ./retry.ts
 ```
 
 ## Usage
 
-Once loaded, the extensions automatically detect and retry their respective error types.
+Once loaded, the extension **automatically** detects and retries both 400/413 and connection errors.
 
-### retry-400-413.ts Commands
-
-| Command | Description |
-|---------|-------------|
-| `/retry-413` | Manually trigger immediate retry (no compaction) |
-| `/retry-config` | Show current retry settings |
-| `/retry-config reset` | Reset the retry attempt counter |
-
-### retry-connection.ts Commands
+### Manual Controls
 
 | Command | Description |
 |---------|-------------|
-| `/retry-connection` | Manually trigger a connection retry |
-| `/retry-connection-status` | Show current retry status and diagnostics |
-| `/retry-connection-reset` | Reset the retry counter to zero |
+| `/retry` | Manually trigger immediate retry (auto-detects error type) |
+| `/retry status` | Show current retry diagnostics for both error types |
+| `/retry reset` | Reset all retry counters and state |
 
 ## Configuration
 
-### retry-400-413.ts
-
-Edit the constants at the top of the file:
+Edit the constants at the top of `retry.ts`:
 
 ```typescript
 const BASE_DELAY_MS = 2000;        // Start with 2 seconds
 const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
-const BACKOFF_MULTIPLIER = 2;     // Double each time
-```
-
-### retry-connection.ts
-
-Edit the constants at the top of the file:
-
-```typescript
-const BASE_DELAY_MS = 2000;        // Start with 2 seconds
-const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
-const BACKOFF_MULTIPLIER = 2;     // Double each time
+const BACKOFF_MULTIPLIER = 2;      // Double each time
 ```
 
 ## How It Works
-
-Both extensions use the same pattern:
 
 1. **Listen to `agent_end` event** — Fires after each agent turn completes
 2. **Check for error patterns** — Examine the last assistant message for specific error signatures
@@ -212,30 +105,71 @@ Both extensions use the same pattern:
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
 
-## Using Both Extensions Together
+## Detected Error Patterns
 
-You can use both extensions simultaneously for comprehensive coverage:
+**400/413 Errors:**
+- HTTP 400 Bad Request
+- HTTP 413 Payload Too Large
+- "bad request" messages
+- "payload too large" messages
+
+**Connection Errors:**
+- Connection / network errors
+- Fetch failures
+- Socket hang up / socket errors
+- `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`
+- DNS lookup failures
+- "Request ended without sending any chunks"
+- Upstream connect errors
+- TLS handshake errors
+- Timeouts awaiting response
+
+## Development
+
+### Running Tests
 
 ```bash
-pi -e ./retry-400-413.ts -e ./retry-connection.ts
+# Run all tests
+npm test
+
+# Run tests in watch mode
+npm run test:watch
+
+# Run tests with coverage
+npm run test:coverage
+
+# Type check
+npm run typecheck
+
+# Dead code detection
+npm run lint:dead
 ```
 
-They handle different error types and don't interfere with each other:
-- `retry-400-413.ts` → 400/413 HTTP errors
-- `retry-connection.ts` → Network/connection errors
+### Project Structure
 
-## Comparison with @georgebashi/pi-retry
+```
+.
+├── retry.ts                   # Main unified extension
+├── src/                       # Shared utilities (testable, DRY)
+│   ├── error-patterns.ts      # Error pattern matching
+│   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, etc.)
+│   └── index.ts               # Barrel exports
+├── __tests__/                 # Comprehensive test suite (94 tests)
+│   ├── helpers.ts             # Test utilities
+│   └── unit/                  # Unit tests
+│       ├── error-patterns.test.ts
+│       └── retry-logic.test.ts
+├── vitest.config.ts           # Test configuration
+└── knip.json                  # Dead code detection config
+```
 
-The npm package `@georgebashi/pi-retry` handles "aborted" streaming errors but explicitly excludes "connection error" (assuming pi's built-in retry handles it). This extension suite:
-
-1. **`retry-connection.ts`** — Handles connection errors that pi might not retry
-2. **`retry-400-413.ts`** — Handles context overflow errors without compaction
-
-They can all work together for maximum coverage:
+### Code Quality
 
 ```bash
-pi install npm:@georgebashi/pi-retry
-# Plus install this extension suite
+# Run all quality checks
+npm test              # 94 unit tests
+npm run typecheck     # TypeScript type checking
+npm run lint:dead     # Dead code detection with knip
 ```
 
 ## Troubleshooting
@@ -244,38 +178,47 @@ pi install npm:@georgebashi/pi-retry
 
 Check that it's loaded in the startup header:
 ```
-Loaded extensions: retry-400-413.ts, retry-connection.ts
+Loaded extensions: retry.ts
 ```
 
 ### Retry not triggering?
 
 Use the status command to diagnose:
 ```
-/retry-connection-status
+/retry status
 ```
 
 ### Want to see what's happening?
 
-The extensions send notifications on retry attempts. If you're not seeing them:
-- Check that `ctx.hasUI` is true (notifications don't work in JSON/print mode)
-- Look at the footer status line for retry status updates
+The extensions send notifications on retry attempts. Look at the footer status line for retry status updates.
 
 ### Too many retries?
 
-For `retry-connection.ts`, you can:
-1. Press `Ctrl+C` to abort the session
-2. Use `/retry-connection-reset` to reset the counter
-3. Edit the file to add a max retry limit
+Use `/retry reset` to clear the counters, or press `Ctrl+C` to abort the session.
+
+## Comparison with @georgebashi/pi-retry
+
+The npm package `@georgebashi/pi-retry` handles "aborted" streaming errors but explicitly excludes "connection error" (assuming pi's built-in retry handles it). This extension:
+
+1. **Handles connection errors** that pi might not retry sufficiently
+2. **Handles 400/413 errors** without compaction
+
+They can work together for maximum coverage:
+
+```bash
+pi install npm:@georgebashi/pi-retry
+# Plus install this extension
+```
 
 ## Limitations
 
 - Extensions cannot override pi's internal `isRetryableError()` check — they run *after* pi decides not to auto-retry
 - Error messages remain in the session history (but are invisible to the LLM)
 - May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
+- **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
 
 ## Related
 
 - [Pi Coding Agent Extensions Docs](https://github.com/badlogic/pi/tree/main/packages/coding-agent/docs/extensions.md)
 - [@georgebashi/pi-retry](https://github.com/georgebashi/pi-retry) — Handles "aborted" streaming errors
 - [Issue #252: Connection error with no retry](https://github.com/badlogic/pi-mono/issues/252)
-- [Context Overflow Detection](https://github.com/badlogic/pi-mono/blob/main/packages/pi-ai/src/utils/overflow.ts)

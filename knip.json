@@ -1,10 +1,7 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
-  "ignore": ["**/__tests__/helpers.ts", "src/index.ts"],
+  "ignore": ["**/__tests__/helpers.ts"],
   "ignoreExportsUsedInFile": true,
-  "entry": [
-    "retry-400-413.ts",
-    "retry-connection.ts"
-  ],
+  "entry": ["retry.ts"],
   "project": ["**/*.ts"]
 }

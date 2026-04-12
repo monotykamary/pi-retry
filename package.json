@@ -51,8 +51,7 @@
   },
   "pi": {
     "extensions": [
-      "./retry-400-413.ts",
-      "./retry-connection.ts"
+      "./retry.ts"
     ]
   }
 }
