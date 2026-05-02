@@ -2,25 +2,30 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   has400or413Error,
   hasConnectionError,
+  hasMaxTokensStop,
   isAssistantMessage,
   getLastAssistantMessage,
   calculateDelay,
   formatDuration,
   getErrorCategory,
   RetryState,
+  ContinuationState,
 } from "./src/index.js";
 
 /**
- * Unified retry extension for handling 400/413 and connection errors
+ * Unified retry extension for handling 400/413 errors, connection errors, and max_tokens continuation
  * 
  * Features:
  * - Automatic detection and retry for both 400/413 and connection errors
  * - Indefinite retry with exponential backoff (capped at 60s)
+ * - Auto-continuation when model hits max output tokens (stopReason "length")
  * - Hidden retry triggers (no TUI clutter)
  * - Unified manual controls via /retry command
  * 
  * 400/413 errors are retried without compaction (use with caution if context is genuinely too large).
  * Connection errors are retried indefinitely until success.
+ * Max_tokens continuations are indefinite — each continuation produces valid output and the model
+ * naturally terminates when done, so there is no reason to impose a limit.
  */
 
 const RETRY_CUSTOM_TYPE = "__retry_trigger";
@@ -28,6 +33,10 @@ const RETRY_CUSTOM_TYPE = "__retry_trigger";
 // Track retry state for both error types
 const state400 = new RetryState();
 const stateConnection = new RetryState();
+
+// Max_tokens continuation state (indefinite — no cap needed)
+const CONTINUATION_PROMPT = "Continue";
+const stateContinuation = new ContinuationState();
 
 // Sleep helper
 function sleep(ms: number): Promise<void> {
@@ -37,29 +46,50 @@ function sleep(ms: number): Promise<void> {
 export default function (pi: ExtensionAPI) {
   let pendingRetryCleanup = false;
 
-  // Reset retry counters on successful completion
+  // Reset retry counters on successful completion (not max_tokens, not error, not aborted)
   pi.on("turn_end", async (event, ctx) => {
     const msg = event.message as any;
     if (msg.role === "assistant" && msg.stopReason !== "error" && msg.stopReason !== "aborted") {
-      if (state400.getAttempt() > 0) {
-        ctx.ui.notify(`400/413 retry succeeded after ${state400.getAttempt()} attempt(s).`, "info");
-        ctx.ui.setStatus("retry-400-413", undefined);
+      if (msg.stopReason !== "length") {
+        // Normal completion — reset everything including continuation count
+        if (state400.getAttempt() > 0) {
+          ctx.ui.notify(`400/413 retry succeeded after ${state400.getAttempt()} attempt(s).`, "info");
+          ctx.ui.setStatus("retry-400-413", undefined);
+        }
+        if (stateConnection.getAttempt() > 0) {
+          ctx.ui.notify(`Connection retry succeeded after ${stateConnection.getAttempt()} attempt(s).`, "info");
+          ctx.ui.setStatus("retry-connection", undefined);
+        }
+        if (stateContinuation.getCount() > 0) {
+          ctx.ui.notify(`Max_tokens continuation completed after ${stateContinuation.getCount()} continuation(s).`, "info");
+          ctx.ui.setStatus("retry-continuation", undefined);
+        }
+        state400.succeed();
+        stateConnection.succeed();
+        stateContinuation.complete();
       }
-      if (stateConnection.getAttempt() > 0) {
-        ctx.ui.notify(`Connection retry succeeded after ${stateConnection.getAttempt()} attempt(s).`, "info");
-        ctx.ui.setStatus("retry-connection", undefined);
-      }
-      state400.succeed();
-      stateConnection.succeed();
     }
   });
 
-  // Handle errors on agent_end
+  // Handle errors and max_tokens on agent_end
   pi.on("agent_end", async (event, ctx) => {
     const entries = ctx.sessionManager.getEntries();
     const lastAssistant = getLastAssistantMessage(entries);
     
     if (!lastAssistant || !isAssistantMessage(lastAssistant)) {
+      return;
+    }
+
+    // Check for max_tokens stop — auto-continue
+    if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
+      stateContinuation.startContinuation();
+      ctx.ui.notify(
+        `Max tokens reached — auto-continuing (continuation ${stateContinuation.getCount()})`,
+        "info",
+      );
+      ctx.ui.setStatus("retry-continuation", `Continuing (${stateContinuation.getCount()})...`);
+      pi.sendUserMessage(CONTINUATION_PROMPT);
+      stateContinuation.endContinuation();
       return;
     }
 
@@ -96,11 +126,13 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Monitor message_end for errors (additional visibility)
+  // Monitor message_end for errors and max_tokens (additional visibility)
   pi.on("message_end", async (event, ctx) => {
     const msg = event.message;
     if (msg.role === "assistant") {
-      if (has400or413Error(msg)) {
+      if (hasMaxTokensStop(msg)) {
+        ctx.ui.setStatus("retry-continuation", "Max tokens reached — will auto-continue...");
+      } else if (has400or413Error(msg)) {
         ctx.ui.setStatus("retry-400-413", "400/413 detected - will retry...");
       } else if (hasConnectionError(msg)) {
         ctx.ui.setStatus("retry-connection", "Connection error - will retry...");
@@ -148,11 +180,18 @@ export default function (pi: ExtensionAPI) {
         status += `  Is retrying: ${stateConnection.getIsRetrying()}\n`;
         status += `  Last error: ${stateConnection.getLastErrorMessage().substring(0, 100) || "None"}\n\n`;
         
+        // Continuation state
+        status += "Max Tokens Continuation:\n";
+        status += `  Continuations used: ${stateContinuation.getCount()}\n`;
+        status += `  Is continuing: ${stateContinuation.getIsContinuing()}\n`;
+        status += `  Continuation prompt: "${CONTINUATION_PROMPT}"\n\n`;
+        
         // Config
         status += "Configuration:\n";
         status += `  Base delay: 2000ms\n`;
         status += `  Max delay: 60000ms\n`;
-        status += `  Backoff multiplier: 2\n\n`;
+        status += `  Backoff multiplier: 2\n`;
+        status += `  Continuation prompt: "${CONTINUATION_PROMPT}"\n\n`;
         
         // Last assistant info
         if (lastAssistant && isAssistantMessage(lastAssistant)) {
@@ -172,8 +211,10 @@ export default function (pi: ExtensionAPI) {
       if (subcommand === "reset") {
         state400.reset();
         stateConnection.reset();
+        stateContinuation.reset();
         ctx.ui.setStatus("retry-400-413", undefined);
         ctx.ui.setStatus("retry-connection", undefined);
+        ctx.ui.setStatus("retry-continuation", undefined);
         ctx.ui.notify("All retry counters reset", "info");
         return;
       }
@@ -184,6 +225,13 @@ export default function (pi: ExtensionAPI) {
       
       if (!lastAssistant || !isAssistantMessage(lastAssistant)) {
         ctx.ui.notify("No assistant message found to retry", "warning");
+        return;
+      }
+
+      // Auto-detect: max_tokens continuation takes priority
+      if (hasMaxTokensStop(lastAssistant)) {
+        ctx.ui.notify("Manually continuing after max_tokens...", "info");
+        pi.sendUserMessage(CONTINUATION_PROMPT);
         return;
       }
 
@@ -203,7 +251,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // No error detected - show status instead
-      ctx.ui.notify("No retryable error detected (400/413 or connection). Use '/retry status' for diagnostics.", "warning");
+      ctx.ui.notify("No retryable error detected (400/413, connection, or max_tokens). Use '/retry status' for diagnostics.", "warning");
     }
   });
 
@@ -211,6 +259,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     state400.reset();
     stateConnection.reset();
+    stateContinuation.reset();
   });
 
   // Helper: send the hidden retry trigger

@@ -28,6 +28,17 @@ export function createAssistantSuccessMessage(content: string = 'Success'): Agen
 }
 
 /**
+ * Create a mock assistant message that hit max_tokens
+ */
+export function createAssistantMaxTokensMessage(content: string = 'Truncated response'): AgentMessage {
+  return {
+    role: 'assistant',
+    stopReason: 'length',
+    content: [{ type: 'text', text: content }],
+  } as unknown as AgentMessage;
+}
+
+/**
  * Create a mock user message
  */
 export function createUserMessage(content: string): AgentMessage {

@@ -129,3 +129,46 @@ export class RetryState {
     this.lastErrorMessage = "";
   }
 }
+
+/**
+ * State manager for tracking max_tokens continuations.
+ *
+ * Unlike RetryState (which caps nothing but counts retries), continuations are
+ * also uncapped — each one produces valid output and the model naturally
+ * terminates when done, so there is no reason to impose a limit.
+ */
+export class ContinuationState {
+  private count = 0;
+  private isContinuing = false;
+
+  getCount(): number {
+    return this.count;
+  }
+
+  getIsContinuing(): boolean {
+    return this.isContinuing;
+  }
+
+  startContinuation(): void {
+    this.isContinuing = true;
+    this.count++;
+  }
+
+  endContinuation(): void {
+    this.isContinuing = false;
+  }
+
+  /**
+   * Called when a turn completes without hitting max_tokens.
+   * Resets the counter since the model finished normally.
+   */
+  complete(): void {
+    this.count = 0;
+    this.isContinuing = false;
+  }
+
+  reset(): void {
+    this.count = 0;
+    this.isContinuing = false;
+  }
+}

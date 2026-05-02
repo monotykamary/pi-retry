@@ -7,6 +7,7 @@ import {
   isAssistantMessage,
   has400or413Error,
   hasConnectionError,
+  hasMaxTokensStop,
   isBuiltinHandledError,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
@@ -214,5 +215,45 @@ describe('CONNECTION_ERROR_PATTERNS', () => {
 describe('BUILTIN_HANDLED_PATTERNS', () => {
   it('has 9 patterns defined', () => {
     expect(BUILTIN_HANDLED_PATTERNS.length).toBe(9);
+  });
+});
+
+// ============================================================================
+// hasMaxTokensStop
+// ============================================================================
+describe('hasMaxTokensStop', () => {
+  it('returns true for assistant messages with stopReason "length"', () => {
+    const msg = { role: 'assistant', stopReason: 'length', content: [] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(true);
+  });
+
+  it('returns false for assistant messages with stopReason "stop"', () => {
+    const msg = { role: 'assistant', stopReason: 'stop', content: [] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+
+  it('returns false for assistant messages with stopReason "toolUse"', () => {
+    const msg = { role: 'assistant', stopReason: 'toolUse', content: [] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+
+  it('returns false for assistant messages with stopReason "error"', () => {
+    const msg = { role: 'assistant', stopReason: 'error', errorMessage: 'something', content: [] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+
+  it('returns false for assistant messages with stopReason "aborted"', () => {
+    const msg = { role: 'assistant', stopReason: 'aborted', content: [] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+
+  it('returns false for user messages', () => {
+    const msg = { role: 'user', content: [{ type: 'text', text: 'test' }] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+
+  it('returns false for toolResult messages', () => {
+    const msg = { role: 'toolResult', content: [] } as unknown as AgentMessage;
+    expect(hasMaxTokensStop(msg)).toBe(false);
   });
 });

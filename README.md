@@ -1,6 +1,6 @@
 # pi-retry Extension
 
-Unified retry extension for the [pi coding agent](https://github.com/badlogic/pi) that provides comprehensive automatic retry handling for 400/413 errors and connection errors.
+Unified retry extension for the [pi coding agent](https://github.com/badlogic/pi) that provides comprehensive automatic retry handling for 400/413 errors, connection errors, and max_tokens continuation.
 
 ## Overview
 
@@ -10,6 +10,7 @@ This extension automatically detects and retries:
 |------------|----------------|----------|
 | HTTP 400/413 | **Indefinite** with capped backoff, NO compaction | Transient context overflow that might resolve |
 | Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors |
+| Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely | Model hits output token limit mid-generation |
 
 ## Problem
 
@@ -25,6 +26,7 @@ This extension provides **automatic** infinite retry with sensible exponential b
 
 **Features:**
 - Automatic detection of 400/413 and connection errors
+- **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap
 - **Indefinite retry** — Keeps retrying until success
 - Exponential backoff with cap: max 60s between retries
 - Hidden retry triggers (no TUI clutter)
@@ -81,8 +83,8 @@ Once loaded, the extension **automatically** detects and retries both 400/413 an
 
 | Command | Description |
 |---------|-------------|
-| `/retry` | Manually trigger immediate retry (auto-detects error type) |
-| `/retry status` | Show current retry diagnostics for both error types |
+| `/retry` | Manually trigger immediate retry (auto-detects: 400/413, connection, or max_tokens) |
+| `/retry status` | Show current retry diagnostics for all error types + continuation state |
 | `/retry reset` | Reset all retry counters and state |
 
 ## Configuration
@@ -93,19 +95,26 @@ Edit the constants at the top of `retry.ts`:
 const BASE_DELAY_MS = 2000;        // Start with 2 seconds
 const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
 const BACKOFF_MULTIPLIER = 2;      // Double each time
+const CONTINUATION_PROMPT = "Continue"; // What to send the model to continue
 ```
 
 ## How It Works
 
 1. **Listen to `agent_end` event** — Fires after each agent turn completes
-2. **Check for error patterns** — Examine the last assistant message for specific error signatures
-3. **Retry with backoff** — Wait (exponential backoff), then trigger a new turn
-4. **Hidden retry triggers** — Use `sendMessage()` with `display: false` and `triggerTurn: true`
+2. **Check for error patterns or max_tokens** — Examine the last assistant message for specific error signatures or `stopReason === "length"`
+3. **Retry or continue** — Wait (exponential backoff for errors), then trigger a new turn via `pi.sendUserMessage("Continue")` for max_tokens or hidden trigger for errors
+4. **Hidden retry triggers** — Use `sendMessage()` with `display: false` and `triggerTurn: true` for error retries
 5. **Context cleanup** — The `context` event strips hidden triggers before the LLM sees them
+6. **Indefinite continuation** — Max_tokens auto-continues are uncapped; each continuation produces valid output and the model naturally terminates when done
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
 
 ## Detected Error Patterns
+
+**Max Tokens (stopReason: "length"):**
+- The model hit its `max_tokens` / output token limit
+- The model's response was truncated mid-generation
+- Auto-continuation sends "Continue" to resume generation
 
 **400/413 Errors:**
 - HTTP 400 Bad Request
@@ -151,10 +160,10 @@ npm run lint:dead
 .
 ├── retry.ts                   # Main unified extension
 ├── src/                       # Shared utilities (testable, DRY)
-│   ├── error-patterns.ts      # Error pattern matching
-│   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, etc.)
+│   ├── error-patterns.ts      # Error pattern matching + hasMaxTokensStop
+│   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, ContinuationState, etc.)
 │   └── index.ts               # Barrel exports
-├── __tests__/                 # Comprehensive test suite (94 tests)
+├── __tests__/                 # Comprehensive test suite (110 tests)
 │   ├── helpers.ts             # Test utilities
 │   └── unit/                  # Unit tests
 │       ├── error-patterns.test.ts
@@ -167,7 +176,7 @@ npm run lint:dead
 
 ```bash
 # Run all quality checks
-npm test              # 94 unit tests
+npm test              # 110 unit tests
 npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```
@@ -216,6 +225,8 @@ pi install npm:@georgebashi/pi-retry
 - Error messages remain in the session history (but are invisible to the LLM)
 - May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
 - **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
+- **Max_tokens continuation** uses `pi.sendUserMessage("Continue")`, which adds a visible user message to the conversation (unlike error retries which use hidden triggers)
+- Continuations are uncapped — the model will naturally finish when done; use `Ctrl+C` to abort if needed
 
 ## Related
 

@@ -97,5 +97,15 @@ export function getErrorCategory(errorMessage: string): '400-413' | 'connection'
   return 'other';
 }
 
+/**
+ * Check if an assistant message stopped because it hit max output tokens.
+ * This is NOT an error — the model simply ran out of its token budget.
+ * stopReason "length" maps to max_tokens/finish_reason_length across providers.
+ */
+export function hasMaxTokensStop(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  return message.stopReason === "length";
+}
+
 // Re-export getLastAssistantMessage for convenience
 export { getLastAssistantMessage } from './retry-logic.js';
