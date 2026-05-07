@@ -18,9 +18,6 @@ import {
 import type { AgentMessage } from '@mariozechner/pi-agent-core';
 import type { TextContent, ImageContent } from '@mariozechner/pi-ai';
 
-// ============================================================================
-// calculateDelay
-// ============================================================================
 describe('calculateDelay', () => {
   it('calculates correct delays for attempts 1-5 with default config', () => {
     expect(calculateDelay(1)).toBe(2000);
@@ -58,9 +55,6 @@ describe('calculateDelay', () => {
   });
 });
 
-// ============================================================================
-// formatDuration
-// ============================================================================
 describe('formatDuration', () => {
   it('formats milliseconds', () => {
     expect(formatDuration(500)).toBe('500ms');
@@ -84,9 +78,6 @@ describe('formatDuration', () => {
   });
 });
 
-// ============================================================================
-// isUserMessageWithContent
-// ============================================================================
 describe('isUserMessageWithContent', () => {
   it('returns true for user messages with string content', () => {
     const msg = { role: 'user', content: 'hello' } as unknown as AgentMessage;
@@ -112,9 +103,6 @@ describe('isUserMessageWithContent', () => {
   });
 });
 
-// ============================================================================
-// isTextContent
-// ============================================================================
 describe('isTextContent', () => {
   it('returns true for valid text content', () => {
     const content = { type: 'text', text: 'hello' } as TextContent;
@@ -148,9 +136,6 @@ describe('isTextContent', () => {
   });
 });
 
-// ============================================================================
-// extractTextContent
-// ============================================================================
 describe('extractTextContent', () => {
   it('returns empty string for undefined', () => {
     expect(extractTextContent(undefined)).toBe('');
@@ -189,9 +174,6 @@ describe('extractTextContent', () => {
   });
 });
 
-// ============================================================================
-// getLastAssistantMessage
-// ============================================================================
 describe('getLastAssistantMessage', () => {
   it('returns undefined for empty entries', () => {
     expect(getLastAssistantMessage([])).toBeUndefined();
@@ -235,9 +217,6 @@ describe('getLastAssistantMessage', () => {
   });
 });
 
-// ============================================================================
-// RetryState
-// ============================================================================
 describe('RetryState', () => {
   let state: RetryState;
 
@@ -297,9 +276,6 @@ describe('RetryState', () => {
   });
 });
 
-// ============================================================================
-// DEFAULT_BACKOFF_CONFIG
-// ============================================================================
 describe('DEFAULT_BACKOFF_CONFIG', () => {
   it('has correct default values', () => {
     expect(DEFAULT_BACKOFF_CONFIG.baseDelayMs).toBe(2000);
@@ -308,9 +284,6 @@ describe('DEFAULT_BACKOFF_CONFIG', () => {
   });
 });
 
-// ============================================================================
-// ContinuationState
-// ============================================================================
 describe('ContinuationState', () => {
   let state: ContinuationState;
 

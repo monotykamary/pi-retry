@@ -15,9 +15,6 @@ import {
 } from '../../src/error-patterns.js';
 import type { AgentMessage } from '@mariozechner/pi-agent-core';
 
-// ============================================================================
-// isAssistantMessage
-// ============================================================================
 describe('isAssistantMessage', () => {
   it('returns true for assistant messages', () => {
     const msg = { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } as unknown as AgentMessage;
@@ -35,9 +32,6 @@ describe('isAssistantMessage', () => {
   });
 });
 
-// ============================================================================
-// has400or413Error
-// ============================================================================
 describe('has400or413Error', () => {
   const createAssistantError = (errorMessage: string): AgentMessage =>
     ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
@@ -86,9 +80,6 @@ describe('has400or413Error', () => {
   });
 });
 
-// ============================================================================
-// hasConnectionError
-// ============================================================================
 describe('hasConnectionError', () => {
   const createAssistantError = (errorMessage: string): AgentMessage =>
     ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
@@ -138,9 +129,6 @@ describe('hasConnectionError', () => {
   });
 });
 
-// ============================================================================
-// isBuiltinHandledError
-// ============================================================================
 describe('isBuiltinHandledError', () => {
   const testCases = [
     { error: 'Overloaded error', expected: true },
@@ -168,9 +156,6 @@ describe('isBuiltinHandledError', () => {
   });
 });
 
-// ============================================================================
-// getErrorCategory
-// ============================================================================
 describe('getErrorCategory', () => {
   it('categorizes 400/413 errors', () => {
     expect(getErrorCategory('400 status code')).toBe('400-413');
@@ -196,9 +181,6 @@ describe('getErrorCategory', () => {
   });
 });
 
-// ============================================================================
-// Pattern coverage
-// ============================================================================
 describe('CONNECTION_ERROR_PATTERNS', () => {
   it('has 19 patterns defined', () => {
     expect(CONNECTION_ERROR_PATTERNS.length).toBe(19);
@@ -218,9 +200,6 @@ describe('BUILTIN_HANDLED_PATTERNS', () => {
   });
 });
 
-// ============================================================================
-// hasMaxTokensStop
-// ============================================================================
 describe('hasMaxTokensStop', () => {
   it('returns true for assistant messages with stopReason "length"', () => {
     const msg = { role: 'assistant', stopReason: 'length', content: [] } as unknown as AgentMessage;
