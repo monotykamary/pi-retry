@@ -15,8 +15,8 @@ import {
   DEFAULT_BACKOFF_CONFIG,
   type BackoffConfig,
 } from '../../src/retry-logic.js';
-import type { AgentMessage } from '@mariozechner/pi-agent-core';
-import type { TextContent, ImageContent } from '@mariozechner/pi-ai';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import type { TextContent, ImageContent } from '@earendil-works/pi-ai';
 
 describe('calculateDelay', () => {
   it('calculates correct delays for attempts 1-5 with default config', () => {

@@ -2,8 +2,8 @@
  * Retry logic utilities
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { TextContent, ImageContent } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
 
 /**
  * Configuration for exponential backoff

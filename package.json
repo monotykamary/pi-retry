@@ -40,9 +40,9 @@
     "lint:dead": "knip --no-gitignore"
   },
   "devDependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "@types/node": "^25.5.0",
     "@vitest/coverage-v8": "^4.1.4",
     "knip": "^6.4.0",

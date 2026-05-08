@@ -2,7 +2,7 @@
  * Error pattern matching utilities for retry extensions
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { calculateDelay as _calculateDelay, formatDuration as _formatDuration } from "./retry-logic.js";
 
 // Re-export retry utilities from error-patterns for convenience

@@ -13,7 +13,7 @@ import {
   CONNECTION_ERROR_PATTERNS,
   BUILTIN_HANDLED_PATTERNS,
 } from '../../src/error-patterns.js';
-import type { AgentMessage } from '@mariozechner/pi-agent-core';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 
 describe('isAssistantMessage', () => {
   it('returns true for assistant messages', () => {

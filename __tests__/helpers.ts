@@ -2,7 +2,7 @@
  * Shared test utilities and helpers
  */
 
-import type { AgentMessage } from '@mariozechner/pi-agent-core';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 
 /**
  * Create a mock assistant error message
