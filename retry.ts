@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+  RETRY_TRIGGER_CUSTOM_TYPE,
+  CONTINUATION_CUSTOM_TYPE,
   has400or413Error,
   hasConnectionError,
   hasMaxTokensStop,
@@ -14,28 +16,31 @@ import {
 
 /**
  * Unified retry extension for handling 400/413 errors, connection errors, and max_tokens continuation
- * 
+ *
  * Features:
  * - Automatic detection and retry for both 400/413 and connection errors
  * - Indefinite retry with exponential backoff (capped at 60s)
  * - Auto-continuation when model hits max output tokens (stopReason "length")
- * - Hidden retry triggers (no TUI clutter)
+ * - ALL triggers are invisible — custom messages with display:false, stripped by context handler
  * - Unified manual controls via /retry command
- * 
+ *
  * 400/413 errors are retried without compaction (use with caution if context is genuinely too large).
  * Connection errors are retried indefinitely until success.
  * Max_tokens continuations are indefinite — each continuation produces valid output and the model
  * naturally terminates when done, so there is no reason to impose a limit.
+ *
+ * Silent continue trick (ported from pi-invisible-continue):
+ *   - sendMessage() with customType + display:false + triggerTurn:true
+ *   - pi's default convertToLlm filters custom-role messages → LLM never sees them
+ *   - context event handler strips them as insurance against custom convertToLlm overrides
+ *   - No user-visible "Continue" message pollution in the conversation
  */
-
-const RETRY_CUSTOM_TYPE = "__retry_trigger";
 
 // Track retry state for both error types
 const state400 = new RetryState();
 const stateConnection = new RetryState();
 
 // Max_tokens continuation state (indefinite — no cap needed)
-const CONTINUATION_PROMPT = "Continue";
 const stateContinuation = new ContinuationState();
 
 // Sleep helper
@@ -44,7 +49,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 export default function (pi: ExtensionAPI) {
-  let pendingRetryCleanup = false;
 
   // Reset retry counters on successful completion (not max_tokens, not error, not aborted)
   pi.on("turn_end", async (event, ctx) => {
@@ -80,7 +84,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Check for max_tokens stop — auto-continue
+    // Check for max_tokens stop — auto-continue (silent, invisible to LLM)
     if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
       stateContinuation.startContinuation();
       ctx.ui.notify(
@@ -88,7 +92,7 @@ export default function (pi: ExtensionAPI) {
         "info",
       );
       ctx.ui.setStatus("retry-continuation", `Continuing (${stateContinuation.getCount()})...`);
-      pi.sendUserMessage(CONTINUATION_PROMPT);
+      triggerContinuation(pi);
       stateContinuation.endContinuation();
       return;
     }
@@ -140,19 +144,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Clean up hidden retry triggers from context
+  // Strip hidden retry/continuation markers from context before each LLM call.
+  // This is insurance — convertToLlm already filters custom roles, but a
+  // custom convertToLlm override could leak them.  Clean proactively.
   pi.on("context", async (event) => {
-    if (!pendingRetryCleanup) return;
-    pendingRetryCleanup = false;
-
-    const cleaned = event.messages.filter((msg: any) => {
-      if (msg.role === "custom" && msg.customType === RETRY_CUSTOM_TYPE) {
-        return false;
-      }
-      return true;
-    });
-
-    return { messages: cleaned };
+    const cleaned = event.messages.filter(
+      (msg: any) =>
+        !(
+          msg.role === "custom" &&
+          (msg.customType === RETRY_TRIGGER_CUSTOM_TYPE ||
+            msg.customType === CONTINUATION_CUSTOM_TYPE)
+        ),
+    );
+    if (cleaned.length !== event.messages.length) {
+      return { messages: cleaned };
+    }
   });
 
   // Unified /retry command with subcommands
@@ -184,14 +190,14 @@ export default function (pi: ExtensionAPI) {
         status += "Max Tokens Continuation:\n";
         status += `  Continuations used: ${stateContinuation.getCount()}\n`;
         status += `  Is continuing: ${stateContinuation.getIsContinuing()}\n`;
-        status += `  Continuation prompt: "${CONTINUATION_PROMPT}"\n\n`;
+        status += `  Trigger: invisible (custom message, LLM never sees a prompt)\n\n`;
         
         // Config
         status += "Configuration:\n";
         status += `  Base delay: 2000ms\n`;
         status += `  Max delay: 60000ms\n`;
         status += `  Backoff multiplier: 2\n`;
-        status += `  Continuation prompt: "${CONTINUATION_PROMPT}"\n\n`;
+        status += `  Continuation: invisible custom message\n\n`;
         
         // Last assistant info
         if (lastAssistant && isAssistantMessage(lastAssistant)) {
@@ -231,7 +237,7 @@ export default function (pi: ExtensionAPI) {
       // Auto-detect: max_tokens continuation takes priority
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
-        pi.sendUserMessage(CONTINUATION_PROMPT);
+        triggerContinuation(pi);
         return;
       }
 
@@ -264,12 +270,25 @@ export default function (pi: ExtensionAPI) {
 
   // Helper: send the hidden retry trigger
   function triggerRetry(pi: ExtensionAPI) {
-    pendingRetryCleanup = true;
     pi.sendMessage(
       {
-        customType: RETRY_CUSTOM_TYPE,
-        content: "Retrying...",
+        customType: RETRY_TRIGGER_CUSTOM_TYPE,
+        content: "",
         display: false,
+        details: {},
+      },
+      { triggerTurn: true },
+    );
+  }
+
+  // Helper: send the hidden continuation trigger (silent — LLM never sees a prompt)
+  function triggerContinuation(pi: ExtensionAPI) {
+    pi.sendMessage(
+      {
+        customType: CONTINUATION_CUSTOM_TYPE,
+        content: "",
+        display: false,
+        details: {},
       },
       { triggerTurn: true },
     );

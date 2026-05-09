@@ -6,17 +6,12 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   calculateDelay,
   formatDuration,
-  isUserMessageWithContent,
-  isTextContent,
-  extractTextContent,
   getLastAssistantMessage,
   RetryState,
   ContinuationState,
   DEFAULT_BACKOFF_CONFIG,
   type BackoffConfig,
 } from '../../src/retry-logic.js';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
-import type { TextContent, ImageContent } from '@earendil-works/pi-ai';
 
 describe('calculateDelay', () => {
   it('calculates correct delays for attempts 1-5 with default config', () => {
@@ -75,102 +70,6 @@ describe('formatDuration', () => {
 
   it('handles edge cases', () => {
     expect(formatDuration(0)).toBe('0ms');
-  });
-});
-
-describe('isUserMessageWithContent', () => {
-  it('returns true for user messages with string content', () => {
-    const msg = { role: 'user', content: 'hello' } as unknown as AgentMessage;
-    expect(isUserMessageWithContent(msg)).toBe(true);
-  });
-
-  it('returns true for user messages with array content', () => {
-    const msg = {
-      role: 'user',
-      content: [{ type: 'text', text: 'hello' }],
-    } as unknown as AgentMessage;
-    expect(isUserMessageWithContent(msg)).toBe(true);
-  });
-
-  it('returns false for assistant messages', () => {
-    const msg = { role: 'assistant', content: [] } as unknown as AgentMessage;
-    expect(isUserMessageWithContent(msg)).toBe(false);
-  });
-
-  it('returns false for user messages without content property', () => {
-    const msg = { role: 'user' } as unknown as AgentMessage;
-    expect(isUserMessageWithContent(msg)).toBe(false);
-  });
-});
-
-describe('isTextContent', () => {
-  it('returns true for valid text content', () => {
-    const content = { type: 'text', text: 'hello' } as TextContent;
-    expect(isTextContent(content)).toBe(true);
-  });
-
-  it('returns false for image content', () => {
-    const content = {
-      type: 'image',
-      source: { type: 'base64', mediaType: 'image/png', data: 'abc' },
-    } as ImageContent;
-    expect(isTextContent(content)).toBe(false);
-  });
-
-  it('returns false for null', () => {
-    expect(isTextContent(null)).toBe(false);
-  });
-
-  it('returns false for non-object values', () => {
-    expect(isTextContent('string')).toBe(false);
-    expect(isTextContent(123)).toBe(false);
-    expect(isTextContent(undefined)).toBe(false);
-  });
-
-  it('returns false for objects without type', () => {
-    expect(isTextContent({ text: 'hello' })).toBe(false);
-  });
-
-  it('returns false for objects with wrong type', () => {
-    expect(isTextContent({ type: 'image', text: 'hello' })).toBe(false);
-  });
-});
-
-describe('extractTextContent', () => {
-  it('returns empty string for undefined', () => {
-    expect(extractTextContent(undefined)).toBe('');
-  });
-
-  it('returns string as-is', () => {
-    expect(extractTextContent('hello world')).toBe('hello world');
-  });
-
-  it('extracts text from content array', () => {
-    const content: (TextContent | ImageContent)[] = [
-      { type: 'text', text: 'hello ' },
-      { type: 'text', text: 'world' },
-    ];
-    expect(extractTextContent(content)).toBe('hello world');
-  });
-
-  it('ignores image content in array', () => {
-    const content = [
-      { type: 'text', text: 'hello ' },
-      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'abc' } },
-      { type: 'text', text: 'world' },
-    ] as (TextContent | ImageContent)[];
-    expect(extractTextContent(content)).toBe('hello world');
-  });
-
-  it('returns empty string for empty array', () => {
-    expect(extractTextContent([])).toBe('');
-  });
-
-  it('returns empty string for array with only images', () => {
-    const content = [
-      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'abc' } },
-    ] as ImageContent[];
-    expect(extractTextContent(content)).toBe('');
   });
 });
 

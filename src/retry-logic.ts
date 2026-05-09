@@ -3,7 +3,6 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
 
 /**
  * Configuration for exponential backoff
@@ -40,38 +39,6 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   const seconds = ((ms % 60000) / 1000).toFixed(0);
   return `${minutes}m ${seconds}s`;
-}
-
-/**
- * Type guard for user message with content
- */
-export function isUserMessageWithContent(
-  message: AgentMessage
-): message is Extract<AgentMessage, { role: "user" }> & { content: (TextContent | ImageContent)[] | string } {
-  return message.role === "user" && "content" in message;
-}
-
-/**
- * Type guard for text content
- */
-export function isTextContent(
-  c: TextContent | ImageContent | unknown
-): c is { type: "text"; text: string } {
-  return typeof c === "object" && c !== null && "type" in c && c.type === "text" && "text" in c;
-}
-
-/**
- * Extract text content from message content array
- */
-export function extractTextContent(
-  content: (TextContent | ImageContent)[] | string | undefined
-): string {
-  if (!content) return "";
-  if (typeof content === "string") return content;
-  return content
-    .filter(isTextContent)
-    .map(c => c.text)
-    .join("");
 }
 
 /**

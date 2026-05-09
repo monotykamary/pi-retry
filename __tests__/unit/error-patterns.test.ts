@@ -8,10 +8,10 @@ import {
   has400or413Error,
   hasConnectionError,
   hasMaxTokensStop,
-  isBuiltinHandledError,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
-  BUILTIN_HANDLED_PATTERNS,
+  RETRY_TRIGGER_CUSTOM_TYPE,
+  CONTINUATION_CUSTOM_TYPE,
 } from '../../src/error-patterns.js';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 
@@ -129,33 +129,6 @@ describe('hasConnectionError', () => {
   });
 });
 
-describe('isBuiltinHandledError', () => {
-  const testCases = [
-    { error: 'Overloaded error', expected: true },
-    { error: 'Rate limit exceeded', expected: true },
-    { error: 'Too many requests', expected: true },
-    { error: '429 Too Many Requests', expected: true },
-    { error: '500 Internal Server Error', expected: true },
-    { error: '502 Bad Gateway', expected: true },
-    { error: '503 Service Unavailable', expected: true },
-    { error: '504 Gateway Timeout', expected: true },
-    { error: 'Service unavailable', expected: true },
-    { error: 'Server error occurred', expected: true },
-    { error: 'Internal error', expected: true },
-    { error: 'Retry delay required', expected: true },
-    // False cases
-    { error: 'Connection error', expected: false },
-    { error: '400 status code', expected: false },
-    { error: 'Some other error', expected: false },
-  ];
-
-  testCases.forEach(({ error, expected }) => {
-    it(`${expected ? 'identifies' : 'rejects'} "${error}" as builtin handled`, () => {
-      expect(isBuiltinHandledError(error)).toBe(expected);
-    });
-  });
-});
-
 describe('getErrorCategory', () => {
   it('categorizes 400/413 errors', () => {
     expect(getErrorCategory('400 status code')).toBe('400-413');
@@ -167,12 +140,6 @@ describe('getErrorCategory', () => {
     expect(getErrorCategory('Connection error')).toBe('connection');
     expect(getErrorCategory('ECONNRESET')).toBe('connection');
     expect(getErrorCategory('Fetch failed')).toBe('connection');
-  });
-
-  it('categorizes builtin handled errors', () => {
-    expect(getErrorCategory('Overloaded')).toBe('builtin');
-    expect(getErrorCategory('Rate limit')).toBe('builtin');
-    expect(getErrorCategory('500 error')).toBe('builtin');
   });
 
   it('categorizes other errors', () => {
@@ -191,12 +158,6 @@ describe('CONNECTION_ERROR_PATTERNS', () => {
       expect(pattern).toBeInstanceOf(RegExp);
       expect(() => 'test'.match(pattern)).not.toThrow();
     });
-  });
-});
-
-describe('BUILTIN_HANDLED_PATTERNS', () => {
-  it('has 9 patterns defined', () => {
-    expect(BUILTIN_HANDLED_PATTERNS.length).toBe(9);
   });
 });
 
@@ -234,5 +195,17 @@ describe('hasMaxTokensStop', () => {
   it('returns false for toolResult messages', () => {
     const msg = { role: 'toolResult', content: [] } as unknown as AgentMessage;
     expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+});
+
+describe('RETRY_TRIGGER_CUSTOM_TYPE', () => {
+  it('exports the expected custom type', () => {
+    expect(RETRY_TRIGGER_CUSTOM_TYPE).toBe('__retry_trigger');
+  });
+});
+
+describe('CONTINUATION_CUSTOM_TYPE', () => {
+  it('exports the expected custom type', () => {
+    expect(CONTINUATION_CUSTOM_TYPE).toBe('__retry_continuation');
   });
 });

@@ -10,7 +10,7 @@ This extension automatically detects and retries:
 |------------|----------------|----------|
 | HTTP 400/413 | **Indefinite** with capped backoff, NO compaction | Transient context overflow that might resolve |
 | Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors |
-| Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely | Model hits output token limit mid-generation |
+| Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely (invisible — no prompt pollution) | Model hits output token limit mid-generation |
 
 ## Problem
 
@@ -26,10 +26,10 @@ This extension provides **automatic** infinite retry with sensible exponential b
 
 **Features:**
 - Automatic detection of 400/413 and connection errors
-- **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap
+- **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, **invisible** to the LLM
 - **Indefinite retry** — Keeps retrying until success
 - Exponential backoff with cap: max 60s between retries
-- Hidden retry triggers (no TUI clutter)
+- **ALL triggers are invisible** — custom messages with `display: false`, stripped by context handler (no TUI clutter, no conversation pollution)
 - Manual controls via unified `/retry` command
 
 ## Installation
@@ -95,17 +95,16 @@ Edit the constants at the top of `retry.ts`:
 const BASE_DELAY_MS = 2000;        // Start with 2 seconds
 const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
 const BACKOFF_MULTIPLIER = 2;      // Double each time
-const CONTINUATION_PROMPT = "Continue"; // What to send the model to continue
+// Continuation is now invisible — no CONTINUATION_PROMPT needed
 ```
 
 ## How It Works
 
 1. **Listen to `agent_end` event** — Fires after each agent turn completes
 2. **Check for error patterns or max_tokens** — Examine the last assistant message for specific error signatures or `stopReason === "length"`
-3. **Retry or continue** — Wait (exponential backoff for errors), then trigger a new turn via `pi.sendUserMessage("Continue")` for max_tokens or hidden trigger for errors
-4. **Hidden retry triggers** — Use `sendMessage()` with `display: false` and `triggerTurn: true` for error retries
-5. **Context cleanup** — The `context` event strips hidden triggers before the LLM sees them
-6. **Indefinite continuation** — Max_tokens auto-continues are uncapped; each continuation produces valid output and the model naturally terminates when done
+3. **Retry or continue (both invisible)** — Wait (exponential backoff for errors), then trigger a new turn via `pi.sendMessage()` with `customType`, `display: false`, and `triggerTurn: true`
+4. **Context cleanup** — The `context` event strips all custom-type triggers before the LLM sees them (insurance against custom `convertToLlm` overrides)
+5. **Indefinite continuation** — Max_tokens auto-continues are uncapped; each continuation produces valid output and the model naturally terminates when done
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
 
@@ -114,7 +113,7 @@ The pi's built-in `transform-messages` already strips aborted/errored assistant 
 **Max Tokens (stopReason: "length"):**
 - The model hit its `max_tokens` / output token limit
 - The model's response was truncated mid-generation
-- Auto-continuation sends "Continue" to resume generation
+- Auto-continuation sends an invisible custom message — no visible "Continue" prompt in the conversation
 
 **400/413 Errors:**
 - HTTP 400 Bad Request
@@ -160,12 +159,11 @@ npm run lint:dead
 .
 ├── retry.ts                   # Main unified extension
 ├── src/                       # Shared utilities (testable, DRY)
-│   ├── error-patterns.ts      # Error pattern matching + hasMaxTokensStop
+│   ├── error-patterns.ts      # Error pattern matching, custom types, hasMaxTokensStop
 │   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, ContinuationState, etc.)
 │   └── index.ts               # Barrel exports
-├── __tests__/                 # Comprehensive test suite (110 tests)
-│   ├── helpers.ts             # Test utilities
-│   └── unit/                  # Unit tests
+├── __tests__/                 # Unit tests
+│   └── unit/
 │       ├── error-patterns.test.ts
 │       └── retry-logic.test.ts
 ├── vitest.config.ts           # Test configuration
@@ -176,7 +174,7 @@ npm run lint:dead
 
 ```bash
 # Run all quality checks
-npm test              # 110 unit tests
+npm test              # 76 unit tests
 npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```
@@ -225,8 +223,6 @@ pi install npm:@georgebashi/pi-retry
 - Error messages remain in the session history (but are invisible to the LLM)
 - May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
 - **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
-- **Max_tokens continuation** uses `pi.sendUserMessage("Continue")`, which adds a visible user message to the conversation (unlike error retries which use hidden triggers)
-- Continuations are uncapped — the model will naturally finish when done; use `Ctrl+C` to abort if needed
 
 ## Related
 

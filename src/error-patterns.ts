@@ -3,10 +3,17 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { calculateDelay as _calculateDelay, formatDuration as _formatDuration } from "./retry-logic.js";
 
-// Re-export retry utilities from error-patterns for convenience
-export { _calculateDelay as calculateDelay, _formatDuration as formatDuration };
+// Custom message types for invisible triggers.
+// These are sent with role="custom" and display=false, so pi's default
+// convertToLlm filters them out.  The context event handler also strips
+// them as insurance.
+
+/** Custom type used for the invisible error-retry trigger. */
+export const RETRY_TRIGGER_CUSTOM_TYPE = "__retry_trigger";
+
+/** Custom type used for the invisible max_tokens continuation trigger. */
+export const CONTINUATION_CUSTOM_TYPE = "__retry_continuation";
 
 // 400/413 error patterns
 const ERROR_400_413_PATTERNS = [
@@ -38,8 +45,8 @@ export const CONNECTION_ERROR_PATTERNS = [
   /request\s*timeout/i,
 ];
 
-// Patterns handled by pi's built-in retry (we may want to skip these)
-export const BUILTIN_HANDLED_PATTERNS = [
+// Patterns handled by pi's built-in retry — used internally by getErrorCategory
+const BUILTIN_HANDLED_PATTERNS = [
   /overloaded/i,
   /rate\s*limit/i,
   /too\s*many\s*requests/i,
@@ -81,19 +88,11 @@ export function hasConnectionError(message: AgentMessage): boolean {
 }
 
 /**
- * Check if error is handled by pi's built-in retry
- */
-export function isBuiltinHandledError(errorMessage: string): boolean {
-  return BUILTIN_HANDLED_PATTERNS.some(pattern => pattern.test(errorMessage));
-}
-
-/**
  * Get error category for logging/display
  */
-export function getErrorCategory(errorMessage: string): '400-413' | 'connection' | 'builtin' | 'other' {
+export function getErrorCategory(errorMessage: string): '400-413' | 'connection' | 'other' {
   if (ERROR_400_413_PATTERNS.some(p => p.test(errorMessage))) return '400-413';
   if (CONNECTION_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'connection';
-  if (BUILTIN_HANDLED_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   return 'other';
 }
 
