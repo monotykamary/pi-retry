@@ -58,15 +58,12 @@ export default function (pi: ExtensionAPI) {
         // Normal completion — reset everything including continuation count
         if (state400.getAttempt() > 0) {
           ctx.ui.notify(`400/413 retry succeeded after ${state400.getAttempt()} attempt(s).`, "info");
-          ctx.ui.setStatus("retry-400-413", undefined);
         }
         if (stateConnection.getAttempt() > 0) {
           ctx.ui.notify(`Connection retry succeeded after ${stateConnection.getAttempt()} attempt(s).`, "info");
-          ctx.ui.setStatus("retry-connection", undefined);
         }
         if (stateContinuation.getCount() > 0) {
           ctx.ui.notify(`Max_tokens continuation completed after ${stateContinuation.getCount()} continuation(s).`, "info");
-          ctx.ui.setStatus("retry-continuation", undefined);
         }
         state400.succeed();
         stateConnection.succeed();
@@ -88,10 +85,9 @@ export default function (pi: ExtensionAPI) {
     if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
       stateContinuation.startContinuation();
       ctx.ui.notify(
-        `Max tokens reached — auto-continuing (continuation ${stateContinuation.getCount()})`,
+        `Max tokens reached — auto-continuing (continuation ${stateContinuation.getCount()})...`,
         "info",
       );
-      ctx.ui.setStatus("retry-continuation", `Continuing (${stateContinuation.getCount()})...`);
       triggerContinuation(pi);
       stateContinuation.endContinuation();
       return;
@@ -104,8 +100,7 @@ export default function (pi: ExtensionAPI) {
       
       const delay = calculateDelay(state400.getAttempt());
       
-      ctx.ui.notify(`400/413 error (attempt ${state400.getAttempt()}): ${errorMsg.substring(0, 100)}`, "warning");
-      ctx.ui.setStatus("retry-400-413", `400/413 retry in ${formatDuration(delay)} (attempt ${state400.getAttempt()})...`);
+      ctx.ui.notify(`400/413 error (attempt ${state400.getAttempt()}) — retrying in ${formatDuration(delay)}: ${errorMsg.substring(0, 100)}`, "warning");
       
       await sleep(delay);
       triggerRetry(pi);
@@ -120,8 +115,7 @@ export default function (pi: ExtensionAPI) {
       
       const delay = calculateDelay(stateConnection.getAttempt());
       
-      ctx.ui.notify(`Connection error (attempt ${stateConnection.getAttempt()}): ${errorMsg.substring(0, 100)}`, "warning");
-      ctx.ui.setStatus("retry-connection", `Connection error - retrying in ${formatDuration(delay)} (attempt ${stateConnection.getAttempt()})...`);
+      ctx.ui.notify(`Connection error (attempt ${stateConnection.getAttempt()}) — retrying in ${formatDuration(delay)}: ${errorMsg.substring(0, 100)}`, "warning");
       
       await sleep(delay);
       triggerRetry(pi);
@@ -130,19 +124,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Monitor message_end for errors and max_tokens (additional visibility)
-  pi.on("message_end", async (event, ctx) => {
-    const msg = event.message;
-    if (msg.role === "assistant") {
-      if (hasMaxTokensStop(msg)) {
-        ctx.ui.setStatus("retry-continuation", "Max tokens reached — will auto-continue...");
-      } else if (has400or413Error(msg)) {
-        ctx.ui.setStatus("retry-400-413", "400/413 detected - will retry...");
-      } else if (hasConnectionError(msg)) {
-        ctx.ui.setStatus("retry-connection", "Connection error - will retry...");
-      }
-    }
-  });
+
 
   // Strip hidden retry/continuation markers from context before each LLM call.
   // This is insurance — convertToLlm already filters custom roles, but a
@@ -218,9 +200,6 @@ export default function (pi: ExtensionAPI) {
         state400.reset();
         stateConnection.reset();
         stateContinuation.reset();
-        ctx.ui.setStatus("retry-400-413", undefined);
-        ctx.ui.setStatus("retry-connection", undefined);
-        ctx.ui.setStatus("retry-continuation", undefined);
         ctx.ui.notify("All retry counters reset", "info");
         return;
       }
