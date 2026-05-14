@@ -3,7 +3,10 @@ import {
   RETRY_TRIGGER_CUSTOM_TYPE,
   CONTINUATION_CUSTOM_TYPE,
   has400or413Error,
+  hasCreditError,
   hasConnectionError,
+  hasRetryableError,
+  isNonRetryableError,
   hasMaxTokensStop,
   isAssistantMessage,
   getLastAssistantMessage,
@@ -15,19 +18,21 @@ import {
 } from "./src/index.js";
 
 /**
- * Unified retry extension for handling 400/413 errors, connection errors, and max_tokens continuation
+ * Unified retry extension — retries EVERY error by default.
+ *
+ * Philosophy: any assistant message with stopReason === "error" is retried
+ * indefinitely with exponential backoff, except a tiny blacklist of known
+ * permanent failures (invalid API key, model not found, etc.).
+ *
+ * Specific categories (400/413, credit, connection, stream exhaustion, etc.)
+ * are tracked for diagnostics but all share the same retry mechanism.
  *
  * Features:
- * - Automatic detection and retry for both 400/413 and connection errors
+ * - Automatic detection and retry for ALL errors (catch-all)
  * - Indefinite retry with exponential backoff (capped at 60s)
  * - Auto-continuation when model hits max output tokens (stopReason "length")
  * - ALL triggers are invisible — custom messages with display:false, stripped by context handler
  * - Unified manual controls via /retry command
- *
- * 400/413 errors are retried without compaction (use with caution if context is genuinely too large).
- * Connection errors are retried indefinitely until success.
- * Max_tokens continuations are indefinite — each continuation produces valid output and the model
- * naturally terminates when done, so there is no reason to impose a limit.
  *
  * Silent continue trick (ported from pi-invisible-continue):
  *   - sendMessage() with customType + display:false + triggerTurn:true
@@ -36,9 +41,11 @@ import {
  *   - No user-visible "Continue" message pollution in the conversation
  */
 
-// Track retry state for both error types
+// Per-category retry state (for diagnostics / messaging)
 const state400 = new RetryState();
+const stateCredit = new RetryState();
 const stateConnection = new RetryState();
+const stateOther = new RetryState();
 
 // Max_tokens continuation state (indefinite — no cap needed)
 const stateContinuation = new ContinuationState();
@@ -59,14 +66,22 @@ export default function (pi: ExtensionAPI) {
         if (state400.getAttempt() > 0) {
           ctx.ui.notify(`400/413 retry succeeded after ${state400.getAttempt()} attempt(s).`, "info");
         }
+        if (stateCredit.getAttempt() > 0) {
+          ctx.ui.notify(`Credit error retry succeeded after ${stateCredit.getAttempt()} attempt(s).`, "info");
+        }
         if (stateConnection.getAttempt() > 0) {
           ctx.ui.notify(`Connection retry succeeded after ${stateConnection.getAttempt()} attempt(s).`, "info");
+        }
+        if (stateOther.getAttempt() > 0) {
+          ctx.ui.notify(`Other error retry succeeded after ${stateOther.getAttempt()} attempt(s).`, "info");
         }
         if (stateContinuation.getCount() > 0) {
           ctx.ui.notify(`Max_tokens continuation completed after ${stateContinuation.getCount()} continuation(s).`, "info");
         }
         state400.succeed();
+        stateCredit.succeed();
         stateConnection.succeed();
+        stateOther.succeed();
         stateContinuation.complete();
       }
     }
@@ -93,34 +108,48 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Check for 400/413 error
-    if (has400or413Error(lastAssistant) && !state400.getIsRetrying()) {
-      const errorMsg = lastAssistant.errorMessage || "Unknown 400/413 error";
-      state400.startRetry(errorMsg);
-      
-      const delay = calculateDelay(state400.getAttempt());
-      
-      ctx.ui.notify(`400/413 error (attempt ${state400.getAttempt()}) — retrying in ${formatDuration(delay)}: ${errorMsg.substring(0, 100)}`, "warning");
-      
+    // Catch-all: retry ANY error except known permanent failures
+    if (hasRetryableError(lastAssistant)) {
+      const errorMsg = lastAssistant.errorMessage || "Unknown error";
+      const category = getErrorCategory(errorMsg);
+
+      // Pick the right state tracker for diagnostics
+      let state: RetryState;
+      let label: string;
+      if (category === "400-413") {
+        state = state400;
+        label = "400/413";
+      } else if (category === "credit") {
+        state = stateCredit;
+        label = "Credit";
+      } else if (category === "connection") {
+        state = stateConnection;
+        label = "Connection";
+      } else {
+        state = stateOther;
+        label = category === "builtin" ? "Server" : "Other";
+      }
+
+      if (state.getIsRetrying()) return;
+
+      state.startRetry(errorMsg);
+      const delay = calculateDelay(state.getAttempt());
+
+      ctx.ui.notify(
+        `${label} error (attempt ${state.getAttempt()}) — retrying in ${formatDuration(delay)}: ${errorMsg.substring(0, 100)}`,
+        "warning",
+      );
+
       await sleep(delay);
       triggerRetry(pi);
-      state400.endRetry();
+      state.endRetry();
       return;
     }
 
-    // Check for connection error
-    if (hasConnectionError(lastAssistant) && !stateConnection.getIsRetrying()) {
-      const errorMsg = lastAssistant.errorMessage || "Unknown connection error";
-      stateConnection.startRetry(errorMsg);
-      
-      const delay = calculateDelay(stateConnection.getAttempt());
-      
-      ctx.ui.notify(`Connection error (attempt ${stateConnection.getAttempt()}) — retrying in ${formatDuration(delay)}: ${errorMsg.substring(0, 100)}`, "warning");
-      
-      await sleep(delay);
-      triggerRetry(pi);
-      stateConnection.endRetry();
-      return;
+    // Log non-retryable errors so the user knows why we didn't retry
+    if (isNonRetryableError(lastAssistant)) {
+      const errorMsg = lastAssistant.errorMessage || "Unknown error";
+      ctx.ui.notify(`Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`, "error");
     }
   });
 
@@ -161,12 +190,24 @@ export default function (pi: ExtensionAPI) {
         status += `  Current attempt: ${state400.getAttempt()}\n`;
         status += `  Is retrying: ${state400.getIsRetrying()}\n`;
         status += `  Last error: ${state400.getLastErrorMessage().substring(0, 100) || "None"}\n\n`;
-        
+
+        // Credit state
+        status += "Credit Errors:\n";
+        status += `  Current attempt: ${stateCredit.getAttempt()}\n`;
+        status += `  Is retrying: ${stateCredit.getIsRetrying()}\n`;
+        status += `  Last error: ${stateCredit.getLastErrorMessage().substring(0, 100) || "None"}\n\n`;
+
         // Connection state
         status += "Connection Errors:\n";
         status += `  Current attempt: ${stateConnection.getAttempt()}\n`;
         status += `  Is retrying: ${stateConnection.getIsRetrying()}\n`;
         status += `  Last error: ${stateConnection.getLastErrorMessage().substring(0, 100) || "None"}\n\n`;
+
+        // Other / catch-all state
+        status += "Other Errors (catch-all):\n";
+        status += `  Current attempt: ${stateOther.getAttempt()}\n`;
+        status += `  Is retrying: ${stateOther.getIsRetrying()}\n`;
+        status += `  Last error: ${stateOther.getLastErrorMessage().substring(0, 100) || "None"}\n\n`;
         
         // Continuation state
         status += "Max Tokens Continuation:\n";
@@ -198,7 +239,9 @@ export default function (pi: ExtensionAPI) {
       // /retry reset - Reset all state
       if (subcommand === "reset") {
         state400.reset();
+        stateCredit.reset();
         stateConnection.reset();
+        stateOther.reset();
         stateContinuation.reset();
         ctx.ui.notify("All retry counters reset", "info");
         return;
@@ -228,6 +271,13 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (hasCreditError(lastAssistant)) {
+        ctx.ui.notify("Manually retrying credit error...", "info");
+        stateCredit.reset();
+        triggerRetry(pi);
+        return;
+      }
+
       if (hasConnectionError(lastAssistant)) {
         ctx.ui.notify("Manually retrying connection error...", "info");
         stateConnection.reset();
@@ -235,15 +285,25 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Catch-all: any other retryable error
+      if (hasRetryableError(lastAssistant)) {
+        ctx.ui.notify("Manually retrying error...", "info");
+        stateOther.reset();
+        triggerRetry(pi);
+        return;
+      }
+
       // No error detected - show status instead
-      ctx.ui.notify("No retryable error detected (400/413, connection, or max_tokens). Use '/retry status' for diagnostics.", "warning");
+      ctx.ui.notify("No retryable error detected. Use '/retry status' for diagnostics.", "warning");
     }
   });
 
   // Initialize
   pi.on("session_start", async () => {
     state400.reset();
+    stateCredit.reset();
     stateConnection.reset();
+    stateOther.reset();
     stateContinuation.reset();
   });
 
