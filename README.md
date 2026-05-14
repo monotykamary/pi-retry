@@ -1,6 +1,12 @@
-# pi-retry Extension
+<div align="center">
+
+# 🔄 pi-retry
 
 Unified retry extension for the [pi coding agent](https://github.com/badlogic/pi) that provides comprehensive automatic retry handling for 400/413 errors, connection errors, and max_tokens continuation.
+
+</div>
+
+---
 
 ## Overview
 
@@ -12,7 +18,9 @@ This extension automatically detects and retries:
 | Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors |
 | Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely (invisible — no prompt pollution) | Model hits output token limit mid-generation |
 
-## Problem
+---
+
+## The Problem
 
 By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded), but:
 
@@ -20,7 +28,7 @@ By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded)
 2. **Connection errors** sometimes get only limited retries before giving up
 3. Some transient network errors aren't retried at all
 
-## Solution
+## The Solution
 
 This extension provides **automatic** infinite retry with sensible exponential backoff (2s → 4s → 8s → ... → 60s max).
 
@@ -31,6 +39,8 @@ This extension provides **automatic** infinite retry with sensible exponential b
 - Exponential backoff with cap: max 60s between retries
 - **ALL triggers are invisible** — custom messages with `display: false`, stripped by context handler (no TUI clutter, no conversation pollution)
 - Manual controls via unified `/retry` command
+
+---
 
 ## Installation
 
@@ -75,6 +85,8 @@ cp retry.ts .pi/extensions/
 pi -e ./retry.ts
 ```
 
+---
+
 ## Usage
 
 Once loaded, the extension **automatically** detects and retries both 400/413 and connection errors.
@@ -87,6 +99,8 @@ Once loaded, the extension **automatically** detects and retries both 400/413 an
 | `/retry status` | Show current retry diagnostics for all error types + continuation state |
 | `/retry reset` | Reset all retry counters and state |
 
+---
+
 ## Configuration
 
 Edit the constants at the top of `retry.ts`:
@@ -98,6 +112,8 @@ const BACKOFF_MULTIPLIER = 2;      // Double each time
 // Continuation is now invisible — no CONTINUATION_PROMPT needed
 ```
 
+---
+
 ## How It Works
 
 1. **Listen to `agent_end` event** — Fires after each agent turn completes
@@ -107,6 +123,8 @@ const BACKOFF_MULTIPLIER = 2;      // Double each time
 5. **Indefinite continuation** — Max_tokens auto-continues are uncapped; each continuation produces valid output and the model naturally terminates when done
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
+
+---
 
 ## Detected Error Patterns
 
@@ -131,6 +149,8 @@ The pi's built-in `transform-messages` already strips aborted/errored assistant 
 - Upstream connect errors
 - TLS handshake errors
 - Timeouts awaiting response
+
+---
 
 ## Development
 
@@ -179,6 +199,8 @@ npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```
 
+---
+
 ## Troubleshooting
 
 ### Extension not working?
@@ -203,6 +225,8 @@ The extensions send notifications on retry attempts. Look at the footer status l
 
 Use `/retry reset` to clear the counters, or press `Ctrl+C` to abort the session.
 
+---
+
 ## Comparison with @georgebashi/pi-retry
 
 The npm package `@georgebashi/pi-retry` handles "aborted" streaming errors but explicitly excludes "connection error" (assuming pi's built-in retry handles it). This extension:
@@ -217,6 +241,8 @@ pi install npm:@georgebashi/pi-retry
 # Plus install this extension
 ```
 
+---
+
 ## Limitations
 
 - Extensions cannot override pi's internal `isRetryableError()` check — they run *after* pi decides not to auto-retry
@@ -224,8 +250,14 @@ pi install npm:@georgebashi/pi-retry
 - May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
 - **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
 
+---
+
 ## Related
 
 - [Pi Coding Agent Extensions Docs](https://github.com/badlogic/pi/tree/main/packages/coding-agent/docs/extensions.md)
 - [@georgebashi/pi-retry](https://github.com/georgebashi/pi-retry) — Handles "aborted" streaming errors
 - [Issue #252: Connection error with no retry](https://github.com/badlogic/pi-mono/issues/252)
+
+## License
+
+MIT
