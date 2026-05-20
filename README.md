@@ -57,7 +57,7 @@ This extension provides **automatic** infinite retry with sensible exponential b
 Install directly from GitHub as a pi package:
 
 ```bash
-pi install git:github.com:monotykamary/pi-retry.git
+pi install https://github.com/monotykamary/pi-retry
 ```
 
 Or add to your `settings.json`:
@@ -65,7 +65,7 @@ Or add to your `settings.json`:
 ```json
 {
   "packages": [
-    "git:github.com:monotykamary/pi-retry.git"
+    "https://github.com/monotykamary/pi-retry"
   ]
 }
 ```
