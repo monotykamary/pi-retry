@@ -57,10 +57,22 @@ function sleep(ms: number): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
 
-  // Reset retry counters on successful completion (not max_tokens, not error, not aborted)
+  // Reset retry counters on successful completion (not max_tokens, not error)
   pi.on("turn_end", async (event, ctx) => {
     const msg = event.message as any;
-    if (msg.role === "assistant" && msg.stopReason !== "error" && msg.stopReason !== "aborted") {
+    if (msg.role === "assistant" && msg.stopReason !== "error") {
+      if (msg.stopReason === "aborted") {
+        // User cancelled — reset retry state so it doesn't leak into other
+        // branches of the session tree.
+        state400.reset();
+        stateCredit.reset();
+        stateConnection.reset();
+        stateOther.reset();
+        // Do NOT reset continuation state — a user abort of a continuation
+        // turn is different from aborting an error retry.
+        stateContinuation.endContinuation();
+        return;
+      }
       if (msg.stopReason !== "length") {
         // Normal completion — reset everything including continuation count
         if (state400.getAttempt() > 0) {
