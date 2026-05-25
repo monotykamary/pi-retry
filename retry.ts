@@ -75,21 +75,6 @@ export default function (pi: ExtensionAPI) {
       }
       if (msg.stopReason !== "length") {
         // Normal completion — reset everything including continuation count
-        if (state400.getAttempt() > 0) {
-          ctx.ui.notify(`400/413 retry succeeded after ${state400.getAttempt()} attempt(s).`, "info");
-        }
-        if (stateCredit.getAttempt() > 0) {
-          ctx.ui.notify(`Credit error retry succeeded after ${stateCredit.getAttempt()} attempt(s).`, "info");
-        }
-        if (stateConnection.getAttempt() > 0) {
-          ctx.ui.notify(`Connection retry succeeded after ${stateConnection.getAttempt()} attempt(s).`, "info");
-        }
-        if (stateOther.getAttempt() > 0) {
-          ctx.ui.notify(`Other error retry succeeded after ${stateOther.getAttempt()} attempt(s).`, "info");
-        }
-        if (stateContinuation.getCount() > 0) {
-          ctx.ui.notify(`Max_tokens continuation completed after ${stateContinuation.getCount()} continuation(s).`, "info");
-        }
         state400.succeed();
         stateCredit.succeed();
         stateConnection.succeed();
