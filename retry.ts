@@ -132,11 +132,6 @@ export default function (pi: ExtensionAPI) {
       state.startRetry(errorMsg);
       const delay = calculateDelay(state.getAttempt());
 
-      ctx.ui.notify(
-        `${label} error (attempt ${state.getAttempt()}) — retrying in ${formatDuration(delay)}: ${errorMsg.substring(0, 100)}`,
-        "warning",
-      );
-
       await sleep(delay);
       triggerRetry(pi);
       state.endRetry();
