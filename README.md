@@ -2,9 +2,16 @@
 
 # 🔄 pi-retry
 
-Unified retry extension for the [pi coding agent](https://github.com/badlogic/pi) that provides **automatic retry for every error** — 400/413, connection errors, credit errors, stream exhaustion, and anything else a provider throws at you.
+**Automatic retry for every error in [pi](https://github.com/earendil-works/pi-coding-agent)**
+
+_400/413, connection errors, credit errors, stream exhaustion — retry them all._
+
+[![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
 </div>
+
+---
 
 ---
 
