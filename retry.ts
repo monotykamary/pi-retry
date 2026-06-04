@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Agent } from "@earendil-works/pi-agent-core";
 import {
-  RETRY_TRIGGER_CUSTOM_TYPE,
-  CONTINUATION_CUSTOM_TYPE,
   has400or413Error,
   hasCreditError,
   hasConnectionError,
@@ -31,15 +30,26 @@ import {
  * - Automatic detection and retry for ALL errors (catch-all)
  * - Indefinite retry with exponential backoff (capped at 60s)
  * - Auto-continuation when model hits max output tokens (stopReason "length")
- * - ALL triggers are invisible — custom messages with display:false, stripped by context handler
+ * - ALL triggers are invisible — agent.prompt([]) resumes the loop with no new message
  * - Unified manual controls via /retry command
  *
- * Silent continue trick (ported from pi-invisible-continue):
- *   - sendMessage() with customType + display:false + triggerTurn:true
- *   - pi's default convertToLlm filters custom-role messages → LLM never sees them
- *   - context event handler strips them as insurance against custom convertToLlm overrides
- *   - No user-visible "Continue" message pollution in the conversation
+ * Invisibility mechanism:
+ *   - Agent.prototype.subscribe monkey-patch captures the Agent instance
+ *   - agent.prompt([]) starts a fresh agent loop with an empty prompt array
+ *   - No message injected into context — LLM sees the exact same message list
+ *   - No convertToLlm involvement, no filter needed, no session artifact
  */
+
+// Capture the live Agent instance when AgentSession subscribes to it.
+// subscribe() is called during AgentSession construction — fires on both
+// fresh sessions and session resumes.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _agent: Agent | null = null;
+const _origSubscribe = Agent.prototype.subscribe as (...args: any[]) => any;
+Agent.prototype.subscribe = function (this: Agent, ...args: any[]) {
+  _agent = this;
+  return _origSubscribe.apply(this, args);
+};
 
 // Per-category retry state (for diagnostics / messaging)
 const state400 = new RetryState();
@@ -93,14 +103,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Check for max_tokens stop — auto-continue (silent, invisible to LLM)
+    // Check for max_tokens stop — auto-continue (invisible to LLM)
     if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
       stateContinuation.startContinuation();
       ctx.ui.notify(
         `Max tokens reached — auto-continuing (continuation ${stateContinuation.getCount()})...`,
         "info",
       );
-      triggerContinuation(pi);
+      triggerInvisibleContinue();
       stateContinuation.endContinuation();
       return;
     }
@@ -133,7 +143,7 @@ export default function (pi: ExtensionAPI) {
       const delay = calculateDelay(state.getAttempt());
 
       await sleep(delay);
-      triggerRetry(pi);
+      triggerInvisibleContinue();
       state.endRetry();
       return;
     }
@@ -146,23 +156,6 @@ export default function (pi: ExtensionAPI) {
   });
 
 
-
-  // Strip hidden retry/continuation markers from context before each LLM call.
-  // This is insurance — convertToLlm already filters custom roles, but a
-  // custom convertToLlm override could leak them.  Clean proactively.
-  pi.on("context", async (event) => {
-    const cleaned = event.messages.filter(
-      (msg: any) =>
-        !(
-          msg.role === "custom" &&
-          (msg.customType === RETRY_TRIGGER_CUSTOM_TYPE ||
-            msg.customType === CONTINUATION_CUSTOM_TYPE)
-        ),
-    );
-    if (cleaned.length !== event.messages.length) {
-      return { messages: cleaned };
-    }
-  });
 
   // Unified /retry command with subcommands
   pi.registerCommand("retry", {
@@ -205,14 +198,14 @@ export default function (pi: ExtensionAPI) {
         status += "Max Tokens Continuation:\n";
         status += `  Continuations used: ${stateContinuation.getCount()}\n`;
         status += `  Is continuing: ${stateContinuation.getIsContinuing()}\n`;
-        status += `  Trigger: invisible (custom message, LLM never sees a prompt)\n\n`;
+        status += `  Trigger: invisible (agent.prompt([]), LLM never sees a prompt)\n\n`;
         
         // Config
         status += "Configuration:\n";
         status += `  Base delay: 2000ms\n`;
         status += `  Max delay: 60000ms\n`;
         status += `  Backoff multiplier: 2\n`;
-        status += `  Continuation: invisible custom message\n\n`;
+        status += `  Continuation: invisible (agent.prompt([]))\n\n`;
         
         // Last assistant info
         if (lastAssistant && isAssistantMessage(lastAssistant)) {
@@ -251,7 +244,7 @@ export default function (pi: ExtensionAPI) {
       // Auto-detect: max_tokens continuation takes priority
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
-        triggerContinuation(pi);
+        triggerInvisibleContinue();
         return;
       }
 
@@ -259,21 +252,21 @@ export default function (pi: ExtensionAPI) {
       if (has400or413Error(lastAssistant)) {
         ctx.ui.notify("Manually retrying 400/413 error...", "info");
         state400.reset();
-        triggerRetry(pi);
+        triggerInvisibleContinue();
         return;
       }
 
       if (hasCreditError(lastAssistant)) {
         ctx.ui.notify("Manually retrying credit error...", "info");
         stateCredit.reset();
-        triggerRetry(pi);
+        triggerInvisibleContinue();
         return;
       }
 
       if (hasConnectionError(lastAssistant)) {
         ctx.ui.notify("Manually retrying connection error...", "info");
         stateConnection.reset();
-        triggerRetry(pi);
+        triggerInvisibleContinue();
         return;
       }
 
@@ -281,7 +274,7 @@ export default function (pi: ExtensionAPI) {
       if (hasRetryableError(lastAssistant)) {
         ctx.ui.notify("Manually retrying error...", "info");
         stateOther.reset();
-        triggerRetry(pi);
+        triggerInvisibleContinue();
         return;
       }
 
@@ -299,29 +292,10 @@ export default function (pi: ExtensionAPI) {
     stateContinuation.reset();
   });
 
-  // Helper: send the hidden retry trigger
-  function triggerRetry(pi: ExtensionAPI) {
-    pi.sendMessage(
-      {
-        customType: RETRY_TRIGGER_CUSTOM_TYPE,
-        content: "",
-        display: false,
-        details: {},
-      },
-      { triggerTurn: true },
-    );
-  }
-
-  // Helper: send the hidden continuation trigger (silent — LLM never sees a prompt)
-  function triggerContinuation(pi: ExtensionAPI) {
-    pi.sendMessage(
-      {
-        customType: CONTINUATION_CUSTOM_TYPE,
-        content: "",
-        display: false,
-        details: {},
-      },
-      { triggerTurn: true },
-    );
+  // Resume the agent loop invisibly — no message injected into context.
+  // The LLM sees the exact same message list it had before.
+  function triggerInvisibleContinue() {
+    if (!_agent) return;
+    _agent.prompt([]);
   }
 }

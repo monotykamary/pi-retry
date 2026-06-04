@@ -9,17 +9,6 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
-// Custom message types for invisible triggers.
-// These are sent with role="custom" and display=false, so pi's default
-// convertToLlm filters them out.  The context event handler also strips
-// them as insurance.
-
-/** Custom type used for the invisible error-retry trigger. */
-export const RETRY_TRIGGER_CUSTOM_TYPE = "__retry_trigger";
-
-/** Custom type used for the invisible max_tokens continuation trigger. */
-export const CONTINUATION_CUSTOM_TYPE = "__retry_continuation";
-
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
 const ERROR_400_413_PATTERNS = [

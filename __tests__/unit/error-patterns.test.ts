@@ -13,8 +13,6 @@ import {
   hasMaxTokensStop,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
-  RETRY_TRIGGER_CUSTOM_TYPE,
-  CONTINUATION_CUSTOM_TYPE,
 } from '../../src/error-patterns.js';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 
@@ -308,14 +306,3 @@ describe('hasMaxTokensStop', () => {
   });
 });
 
-describe('RETRY_TRIGGER_CUSTOM_TYPE', () => {
-  it('exports the expected custom type', () => {
-    expect(RETRY_TRIGGER_CUSTOM_TYPE).toBe('__retry_trigger');
-  });
-});
-
-describe('CONTINUATION_CUSTOM_TYPE', () => {
-  it('exports the expected custom type', () => {
-    expect(CONTINUATION_CUSTOM_TYPE).toBe('__retry_continuation');
-  });
-});
