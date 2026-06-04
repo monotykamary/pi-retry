@@ -1,5 +1,5 @@
 {
-  "name": "pi-retry",
+  "name": "@monotykamary/pi-retry",
   "version": "0.2.0",
   "description": "Extension suite for pi coding agent that handles 400/413 errors and connection errors with automatic retry",
   "type": "module",
