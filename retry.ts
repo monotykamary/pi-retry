@@ -363,30 +363,10 @@ export default function (pi: ExtensionAPI) {
       // waited.  agent.state.isStreaming is authoritative.
       if (_agent.state.isStreaming) return;
 
-      // Remove the error assistant message from the transcript so the LLM
-      // can retry from the same context.  (The session's _prepareRetry does
-      // the same thing for built-in retries.)
-      //
-      // IMPORTANT: We must strip BEFORE calling prompt([]) — if prompt
-      // starts successfully, the LLM sees the context without the error
-      // and generates a fresh response.  If prompt fails (swallowed by
-      // .catch()), we restore the message so the agent state stays
-      // consistent.
-      const messages = _agent.state.messages;
-      const hadErrorAssistant = messages.length > 0 && messages[messages.length - 1].role === "assistant";
-      if (hadErrorAssistant) {
-        _agent.state.messages = messages.slice(0, -1);
-      }
-
       // Guard 4: .catch() swallows the "already processing" error as a
       // last resort.  agent.prompt() is async, so errors become rejected
       // Promises — a try/catch around an un-awaited call catches nothing.
-      // If prompt failed, restore the stripped error message.
-      _agent.prompt([]).catch(() => {
-        if (hadErrorAssistant) {
-          _agent.state.messages = messages;
-        }
-      });
+      _agent.prompt([]).catch(() => {});
     } finally {
       _continueInProgress = false;
     }

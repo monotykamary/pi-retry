@@ -31,7 +31,7 @@ interface MockAgentInstance {
   listeners: Set<Function>;
   waitForIdle: ReturnType<typeof vi.fn>;
   prompt: ReturnType<typeof vi.fn>;
-  state: { isStreaming: boolean; messages: AgentMessage[]; tools: unknown[] };
+  state: { isStreaming: boolean };
   subscribe(listener: Function): () => boolean;
   _setIsStreaming(val: boolean): void;
 }
@@ -40,17 +40,12 @@ function createMockAgent(overrides?: {
   waitForIdle?: () => Promise<void>;
   prompt?: () => Promise<void>;
   isStreaming?: boolean;
-  messages?: AgentMessage[];
 }): MockAgentInstance {
   const agent: MockAgentInstance = {
     listeners: new Set<Function>(),
     waitForIdle: overrides?.waitForIdle ?? vi.fn().mockResolvedValue(undefined),
     prompt: overrides?.prompt ?? vi.fn().mockResolvedValue(undefined),
-    state: {
-      isStreaming: overrides?.isStreaming ?? false,
-      messages: overrides?.messages ?? [],
-      tools: [],
-    },
+    state: { isStreaming: overrides?.isStreaming ?? false },
     subscribe(listener: Function) {
       this.listeners.add(listener);
       return () => this.listeners.delete(listener);
@@ -283,69 +278,6 @@ describe("triggerInvisibleContinue race condition guards", () => {
 
       expect(agent.prompt).toHaveBeenCalledTimes(1);
       expect(agent.prompt).toHaveBeenCalledWith([]);
-    } finally {
-      restore();
-    }
-  });
-
-  it("strips the error assistant message from the transcript before retrying", async () => {
-    const errorAssistant = {
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "Connection error",
-      content: [],
-    } as unknown as AgentMessage;
-    const userMsg = {
-      role: "user",
-      content: [{ type: "text", text: "hello" }],
-    } as unknown as AgentMessage;
-
-    const { handlers, agent, restore } = await setup({
-      messages: [userMsg, errorAssistant],
-    });
-    try {
-      const entries = [errorEntry("Connection error")];
-      fireAgentEndAsync(handlers, entries);
-
-      await advanceThroughRetry();
-
-      // The error assistant message should have been stripped
-      expect(agent.state.messages.length).toBe(1);
-      expect(agent.state.messages[0].role).toBe("user");
-      expect(agent.prompt).toHaveBeenCalledTimes(1);
-    } finally {
-      restore();
-    }
-  });
-
-  it("restores the error assistant message if prompt fails", async () => {
-    const errorAssistant = {
-      role: "assistant",
-      stopReason: "error",
-      errorMessage: "Connection error",
-      content: [],
-    } as unknown as AgentMessage;
-    const userMsg = {
-      role: "user",
-      content: [{ type: "text", text: "hello" }],
-    } as unknown as AgentMessage;
-
-    const { handlers, agent, restore } = await setup({
-      prompt: vi.fn().mockImplementation(() =>
-        Promise.reject(new Error("Agent is already processing a prompt")),
-      ),
-      messages: [userMsg, errorAssistant],
-    });
-    try {
-      const entries = [errorEntry("Connection error")];
-      fireAgentEndAsync(handlers, entries);
-
-      await advanceThroughRetry();
-
-      // prompt failed — the error assistant message should be restored
-      expect(agent.state.messages.length).toBe(2);
-      expect(agent.state.messages[1].role).toBe("assistant");
-      expect(agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       restore();
     }
