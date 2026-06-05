@@ -110,7 +110,8 @@ export default function (pi: ExtensionAPI) {
         `Max tokens reached — auto-continuing (continuation ${stateContinuation.getCount()})...`,
         "info",
       );
-      triggerInvisibleContinue();
+      // Must NOT await — see triggerInvisibleContinue() for explanation
+      void triggerInvisibleContinue();
       stateContinuation.endContinuation();
       return;
     }
@@ -143,7 +144,8 @@ export default function (pi: ExtensionAPI) {
       const delay = calculateDelay(state.getAttempt());
 
       await sleep(delay);
-      triggerInvisibleContinue();
+      // Must NOT await — see triggerInvisibleContinue() for explanation
+      void triggerInvisibleContinue();
       state.endRetry();
       return;
     }
@@ -244,7 +246,7 @@ export default function (pi: ExtensionAPI) {
       // Auto-detect: max_tokens continuation takes priority
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
-        triggerInvisibleContinue();
+        void triggerInvisibleContinue();
         return;
       }
 
@@ -252,21 +254,21 @@ export default function (pi: ExtensionAPI) {
       if (has400or413Error(lastAssistant)) {
         ctx.ui.notify("Manually retrying 400/413 error...", "info");
         state400.reset();
-        triggerInvisibleContinue();
+        void triggerInvisibleContinue();
         return;
       }
 
       if (hasCreditError(lastAssistant)) {
         ctx.ui.notify("Manually retrying credit error...", "info");
         stateCredit.reset();
-        triggerInvisibleContinue();
+        void triggerInvisibleContinue();
         return;
       }
 
       if (hasConnectionError(lastAssistant)) {
         ctx.ui.notify("Manually retrying connection error...", "info");
         stateConnection.reset();
-        triggerInvisibleContinue();
+        void triggerInvisibleContinue();
         return;
       }
 
@@ -274,7 +276,7 @@ export default function (pi: ExtensionAPI) {
       if (hasRetryableError(lastAssistant)) {
         ctx.ui.notify("Manually retrying error...", "info");
         stateOther.reset();
-        triggerInvisibleContinue();
+        void triggerInvisibleContinue();
         return;
       }
 
@@ -294,8 +296,15 @@ export default function (pi: ExtensionAPI) {
 
   // Resume the agent loop invisibly — no message injected into context.
   // The LLM sees the exact same message list it had before.
-  function triggerInvisibleContinue() {
+  //
+  // IMPORTANT: We must wait for the agent to become idle before calling
+  // prompt().  The agent_end event fires while the active run is still
+  // set (it's cleared in the finally block, after all listeners settle).
+  // Calling prompt() inside an agent_end listener would otherwise throw
+  // "Agent is already processing a prompt" because activeRun is truthy.
+  async function triggerInvisibleContinue() {
     if (!_agent) return;
+    await _agent.waitForIdle();
     _agent.prompt([]);
   }
 }
