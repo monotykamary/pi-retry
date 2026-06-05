@@ -43,7 +43,7 @@ function createMockAgent(overrides?: {
   const agent: MockAgentInstance = {
     listeners: new Set<Function>(),
     waitForIdle: overrides?.waitForIdle ?? vi.fn().mockResolvedValue(undefined),
-    prompt: overrides?.prompt ?? vi.fn(),
+    prompt: overrides?.prompt ?? vi.fn().mockResolvedValue(undefined),
     state: { isStreaming: overrides?.isStreaming ?? false },
     subscribe(listener: Function) {
       this.listeners.add(listener);
@@ -198,27 +198,31 @@ describe("triggerInvisibleContinue race condition guards", () => {
     }
   });
 
-  it("Guard 3 (catch): swallows 'already processing' error from prompt()", async () => {
+  it("Guard 3 (.catch): swallows 'already processing' rejected promise from prompt()", async () => {
+    // agent.prompt() is async — errors become rejected Promises, not
+    // synchronous throws.  A try/catch around an un-awaited async call
+    // catches nothing.  The .catch() handler on the returned Promise is
+    // what actually swallows the error.
     const { handlers, agent, restore } = await setup({
-      prompt: vi.fn().mockImplementation(() => {
-        throw new Error("Agent is already processing a prompt");
-      }),
+      prompt: vi.fn().mockImplementation(() =>
+        Promise.reject(new Error("Agent is already processing a prompt")),
+      ),
     });
     try {
       const entries = [errorEntry("Connection error")];
       fireAgentEndAsync(handlers, entries);
 
-      // Must NOT throw — the try/catch in triggerInvisibleContinue swallows it
+      // Advance through backoff + waitForIdle + prompt() settlement
       await advanceThroughRetry();
 
-      // prompt was attempted but the error was swallowed (no unhandled rejection)
+      // prompt was attempted but the rejection was swallowed by .catch()
       expect(agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       restore();
     }
   });
 
-  it("combines all guards: concurrent triggers + user start + throw are all safe", async () => {
+  it("combines all guards: concurrent triggers + user start + reject are all safe", async () => {
     let promptCallCount = 0;
 
     const { handlers, agent, restore } = await setup({
@@ -229,8 +233,9 @@ describe("triggerInvisibleContinue race condition guards", () => {
       prompt: vi.fn().mockImplementation(() => {
         promptCallCount++;
         if (promptCallCount > 1) {
-          throw new Error("Agent is already processing a prompt");
+          return Promise.reject(new Error("Agent is already processing a prompt"));
         }
+        return Promise.resolve();
       }),
     });
     try {
@@ -267,9 +272,9 @@ describe("triggerInvisibleContinue race condition guards", () => {
 
   it("/retry command also benefits from the guards", async () => {
     const { commands, agent, restore } = await setup({
-      prompt: vi.fn().mockImplementation(() => {
-        throw new Error("Agent is already processing a prompt");
-      }),
+      prompt: vi.fn().mockImplementation(() =>
+        Promise.reject(new Error("Agent is already processing a prompt")),
+      ),
     });
     try {
       const retryHandler = commands["retry"]?.handler;
@@ -318,7 +323,7 @@ describe("triggerInvisibleContinue race condition guards", () => {
 
       // Reconfigure agent for normal operation
       agent.waitForIdle = vi.fn().mockResolvedValue(undefined);
-      agent.prompt = vi.fn();
+      agent.prompt = vi.fn().mockResolvedValue(undefined);
 
       // A new retry should work — the mutex is no longer stuck
       fireAgentEndAsync(handlers, [errorEntry("Connection error")]);

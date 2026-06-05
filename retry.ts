@@ -313,7 +313,7 @@ export default function (pi: ExtensionAPI) {
   // GUARDS (three layers):
   //   1. _continueInProgress mutex — prevents concurrent calls from racing
   //   2. isStreaming pre-flight — detects user-initiated runs before prompt()
-  //   3. try/catch — final safety net, swallows the error gracefully
+  //   3. .catch() on prompt() — final safety net, swallows rejected promises
   async function triggerInvisibleContinue() {
     if (!_agent) return;
 
@@ -329,13 +329,14 @@ export default function (pi: ExtensionAPI) {
       // directly from the activeRun field, no TOCTOU beyond the next line).
       if (_agent.state.isStreaming) return;
 
-      try {
-        _agent.prompt([]);
-      } catch {
-        // Guard 3: catch the "already processing" error as a last resort.
-        // This handles the remaining microtask TOCTOU gap between the
-        // isStreaming check and prompt() acquiring the lock.
-      }
+      // Guard 3: .catch() swallows the "already processing" error as a
+      // last resort.  This handles the remaining microtask TOCTOU gap
+      // between the isStreaming check and prompt() acquiring the lock.
+      //
+      // IMPORTANT: agent.prompt() is async, so errors become rejected
+      // Promises — a try/catch around an un-awaited call catches nothing.
+      // Must use .catch() on the returned Promise instead.
+      _agent.prompt([]).catch(() => {});
     } finally {
       _continueInProgress = false;
     }
