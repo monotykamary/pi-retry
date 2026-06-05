@@ -1,10 +1,11 @@
 /**
  * Integration tests for the triggerInvisibleContinue race condition guards.
  *
- * The three guards prevent "Agent is already processing" errors:
+ * Four-layer defense against "Agent is already processing" errors:
  *   1. _continueInProgress mutex — prevents concurrent calls from racing
- *   2. isStreaming pre-flight — detects user-initiated runs before prompt()
- *   3. try/catch — final safety net, swallows the error gracefully
+ *   2. waitForIdle + settle loop — waits for session to fully finish
+ *   3. isStreaming pre-flight — detects user-initiated runs before prompt()
+ *   4. .catch() on prompt() — final safety net, swallows rejected promises
  *
  * The retry handler sleeps with exponential backoff (starting at 2s) before
  * calling triggerInvisibleContinue.  We use vi.useFakeTimers() and
@@ -30,21 +31,26 @@ interface MockAgentInstance {
   listeners: Set<Function>;
   waitForIdle: ReturnType<typeof vi.fn>;
   prompt: ReturnType<typeof vi.fn>;
-  state: { isStreaming: boolean };
+  state: { isStreaming: boolean; messages: AgentMessage[]; tools: unknown[] };
   subscribe(listener: Function): () => boolean;
   _setIsStreaming(val: boolean): void;
 }
 
 function createMockAgent(overrides?: {
   waitForIdle?: () => Promise<void>;
-  prompt?: () => void;
+  prompt?: () => Promise<void>;
   isStreaming?: boolean;
+  messages?: AgentMessage[];
 }): MockAgentInstance {
   const agent: MockAgentInstance = {
     listeners: new Set<Function>(),
     waitForIdle: overrides?.waitForIdle ?? vi.fn().mockResolvedValue(undefined),
     prompt: overrides?.prompt ?? vi.fn().mockResolvedValue(undefined),
-    state: { isStreaming: overrides?.isStreaming ?? false },
+    state: {
+      isStreaming: overrides?.isStreaming ?? false,
+      messages: overrides?.messages ?? [],
+      tools: [],
+    },
     subscribe(listener: Function) {
       this.listeners.add(listener);
       return () => this.listeners.delete(listener);
@@ -86,13 +92,6 @@ function errorEntry(errorMessage: string, stopReason = "error"): object {
   };
 }
 
-/**
- * Fire agent_end handlers WITHOUT awaiting them.
- *
- * The handler calls `await sleep(2000)` (exponential backoff), so awaiting it
- * would block until fake timers are advanced.  Instead, we fire-and-forget and
- * let the caller advance timers explicitly.
- */
 function fireAgentEndAsync(
   handlers: Record<string, Function[]>,
   entries: unknown[],
@@ -100,27 +99,14 @@ function fireAgentEndAsync(
   const fns = handlers["agent_end"] ?? [];
   const ctx = createMockCtx(entries);
   for (const fn of fns) {
-    // Fire and forget — the handler will suspend at sleep() and resume when
-    // vi.advanceTimersByTimeAsync() is called.
     void fn({ messages: [] }, ctx);
   }
 }
 
-/**
- * Advance fake timers through the retry backoff sleep and flush microtasks.
- *
- * - The first retry attempt sleeps 2000ms (base delay).
- * - advanceTimersByTimeAsync also flushes pending microtasks (waitForIdle,
- *   prompt, etc.) so everything settles in one call.
- */
 async function advanceThroughRetry(ms = 2500) {
   await vi.advanceTimersByTimeAsync(ms);
 }
 
-/**
- * Load the retry extension with fresh module-level state.
- * Returns the event handlers, commands, and the captured mock agent.
- */
 async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
   vi.resetModules();
 
@@ -133,8 +119,6 @@ async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
   const { api, handlers, commands } = createMockAPI();
   factory(api);
 
-  // Create a mock agent and register it via the monkey-patched subscribe
-  // so _agent inside retry.ts points to our controllable instance.
   const agent = createMockAgent(agentOverrides);
   Agent.prototype.subscribe.call(agent, vi.fn());
 
@@ -156,16 +140,11 @@ describe("triggerInvisibleContinue race condition guards", () => {
     try {
       const entries = [errorEntry("Connection error")];
 
-      // Fire two agent_end events concurrently.
-      // The second one will see state.getIsRetrying() === true and bail,
-      // so only one triggerInvisibleContinue path is entered.
       fireAgentEndAsync(handlers, entries);
       fireAgentEndAsync(handlers, entries);
 
-      // Advance through the backoff sleep + flush microtasks
       await advanceThroughRetry();
 
-      // Only one prompt([]) call should have been made
       expect(agent.prompt).toHaveBeenCalledTimes(1);
       expect(agent.prompt).toHaveBeenCalledWith([]);
     } finally {
@@ -173,14 +152,65 @@ describe("triggerInvisibleContinue race condition guards", () => {
     }
   });
 
-  it("Guard 2 (isStreaming): skips prompt() when user started a new run", async () => {
-    let idleResolved = false;
+  it("Guard 2 (settle loop): waits for session to finish its own continue() calls", async () => {
+    // Simulate: session's built-in retry calls continue() after our waitForIdle resolves.
+    // The session sets isStreaming=true when it starts a new run via continue().
+    let waitForIdleCallCount = 0;
     const { handlers, agent, restore } = await setup({
       waitForIdle: vi.fn().mockImplementation(async () => {
-        // Simulate: user sent a message while we waited for idle.
-        // The agent is now streaming, so we should NOT call prompt().
+        waitForIdleCallCount++;
+        // First waitForIdle: simulate the session's continue() starting a
+        // new run (sets isStreaming=true).  It will finish on the next call.
+        if (waitForIdleCallCount === 1) {
+          agent._setIsStreaming(true);
+        } else {
+          // Second+ call: the session's run has finished
+          agent._setIsStreaming(false);
+        }
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      await advanceThroughRetry(5000);
+
+      // Our code should have waited for the session's run to finish
+      // (isStreaming went back to false) before calling prompt().
+      expect(agent.waitForIdle).toHaveBeenCalledTimes(2);
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("Guard 2 (settle loop): bails out when session handles the retry itself", async () => {
+    // The session's continue() starts a new run that doesn't finish —
+    // our code should detect the ongoing stream and not call prompt().
+    const { handlers, agent, restore } = await setup({
+      waitForIdle: vi.fn().mockImplementation(async () => {
+        // Session started a new run and it's still streaming — our code
+        // should detect this and bail.
         agent._setIsStreaming(true);
-        idleResolved = true;
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      await advanceThroughRetry(5000);
+
+      // The settle loop kept seeing isStreaming=true → never called prompt()
+      expect(agent.prompt).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("Guard 3 (isStreaming): skips prompt() when user started a new run", async () => {
+    const { handlers, agent, restore } = await setup({
+      waitForIdle: vi.fn().mockImplementation(async () => {
+        agent._setIsStreaming(true);
       }),
     });
     try {
@@ -189,20 +219,13 @@ describe("triggerInvisibleContinue race condition guards", () => {
 
       await advanceThroughRetry();
 
-      // waitForIdle was called (the guard was reached)
-      expect(agent.waitForIdle).toHaveBeenCalled();
-      // But prompt should NOT have been called — isStreaming guard caught it
       expect(agent.prompt).not.toHaveBeenCalled();
     } finally {
       restore();
     }
   });
 
-  it("Guard 3 (.catch): swallows 'already processing' rejected promise from prompt()", async () => {
-    // agent.prompt() is async — errors become rejected Promises, not
-    // synchronous throws.  A try/catch around an un-awaited async call
-    // catches nothing.  The .catch() handler on the returned Promise is
-    // what actually swallows the error.
+  it("Guard 4 (.catch): swallows 'already processing' rejected promise from prompt()", async () => {
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() =>
         Promise.reject(new Error("Agent is already processing a prompt")),
@@ -212,22 +235,19 @@ describe("triggerInvisibleContinue race condition guards", () => {
       const entries = [errorEntry("Connection error")];
       fireAgentEndAsync(handlers, entries);
 
-      // Advance through backoff + waitForIdle + prompt() settlement
       await advanceThroughRetry();
 
-      // prompt was attempted but the rejection was swallowed by .catch()
       expect(agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       restore();
     }
   });
 
-  it("combines all guards: concurrent triggers + user start + reject are all safe", async () => {
+  it("combines all guards: concurrent triggers + session retry + reject are all safe", async () => {
     let promptCallCount = 0;
 
     const { handlers, agent, restore } = await setup({
       waitForIdle: vi.fn().mockImplementation(async () => {
-        // User started a run while we waited — isStreaming becomes true
         agent._setIsStreaming(true);
       }),
       prompt: vi.fn().mockImplementation(() => {
@@ -241,14 +261,12 @@ describe("triggerInvisibleContinue race condition guards", () => {
     try {
       const entries = [errorEntry("Connection error")];
 
-      // Fire three concurrent triggers — mutex + isStreaming + catch all exercised
       fireAgentEndAsync(handlers, entries);
       fireAgentEndAsync(handlers, entries);
       fireAgentEndAsync(handlers, entries);
 
-      await advanceThroughRetry();
+      await advanceThroughRetry(5000);
 
-      // At most one prompt call should have been attempted
       expect(promptCallCount).toBeLessThanOrEqual(1);
     } finally {
       restore();
@@ -270,6 +288,36 @@ describe("triggerInvisibleContinue race condition guards", () => {
     }
   });
 
+  it("strips the error assistant message from the transcript before retrying", async () => {
+    const errorAssistant = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Connection error",
+      content: [],
+    } as unknown as AgentMessage;
+    const userMsg = {
+      role: "user",
+      content: [{ type: "text", text: "hello" }],
+    } as unknown as AgentMessage;
+
+    const { handlers, agent, restore } = await setup({
+      messages: [userMsg, errorAssistant],
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      await advanceThroughRetry();
+
+      // The error assistant message should have been stripped
+      expect(agent.state.messages.length).toBe(1);
+      expect(agent.state.messages[0].role).toBe("user");
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
   it("/retry command also benefits from the guards", async () => {
     const { commands, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() =>
@@ -283,10 +331,8 @@ describe("triggerInvisibleContinue race condition guards", () => {
       const entries = [errorEntry("Connection error")];
       const ctx = createMockCtx(entries);
 
-      // Manual /retry while agent is already processing — must not throw
       await expect(retryHandler!([], ctx)).resolves.toBeUndefined();
 
-      // Advance through any pending timer
       await advanceThroughRetry();
     } finally {
       restore();
@@ -294,7 +340,6 @@ describe("triggerInvisibleContinue race condition guards", () => {
   });
 
   it("session_start resets _continueInProgress mutex", async () => {
-    // Use a hanging waitForIdle so triggerInvisibleContinue stays in-flight
     let resolveIdle!: () => void;
     const { handlers, agent, restore } = await setup({
       waitForIdle: vi.fn().mockImplementation(
@@ -304,28 +349,20 @@ describe("triggerInvisibleContinue race condition guards", () => {
     try {
       const entries = [errorEntry("Connection error")];
 
-      // Fire agent_end — triggerInvisibleContinue will hang at waitForIdle
       fireAgentEndAsync(handlers, entries);
-
-      // Advance through the backoff sleep only (waitForIdle still pending)
       await vi.advanceTimersByTimeAsync(2500);
 
-      // Now fire session_start — this should reset _continueInProgress
       const sessionHandlers = handlers["session_start"] ?? [];
       for (const fn of sessionHandlers) {
         await fn({}, createMockCtx());
       }
 
-      // Resolve the hanging waitForIdle — triggerInvisibleContinue's finally
-      // block will set _continueInProgress = false
       resolveIdle();
       await vi.advanceTimersByTimeAsync(0);
 
-      // Reconfigure agent for normal operation
       agent.waitForIdle = vi.fn().mockResolvedValue(undefined);
       agent.prompt = vi.fn().mockResolvedValue(undefined);
 
-      // A new retry should work — the mutex is no longer stuck
       fireAgentEndAsync(handlers, [errorEntry("Connection error")]);
       await advanceThroughRetry();
 
