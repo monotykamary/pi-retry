@@ -60,6 +60,12 @@ const stateOther = new RetryState();
 // Max_tokens continuation state (indefinite — no cap needed)
 const stateContinuation = new ContinuationState();
 
+// Mutex: only one triggerInvisibleContinue may be in-flight at a time.
+// Without this, concurrent agent_end events (or a manual /retry during an
+// automatic retry) race through waitForIdle() and both call prompt([]),
+// producing "Agent is already processing".
+let _continueInProgress = false;
+
 // Sleep helper
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -292,6 +298,7 @@ export default function (pi: ExtensionAPI) {
     stateConnection.reset();
     stateOther.reset();
     stateContinuation.reset();
+    _continueInProgress = false;
   });
 
   // Resume the agent loop invisibly — no message injected into context.
@@ -302,9 +309,35 @@ export default function (pi: ExtensionAPI) {
   // set (it's cleared in the finally block, after all listeners settle).
   // Calling prompt() inside an agent_end listener would otherwise throw
   // "Agent is already processing a prompt" because activeRun is truthy.
+  //
+  // GUARDS (three layers):
+  //   1. _continueInProgress mutex — prevents concurrent calls from racing
+  //   2. isStreaming pre-flight — detects user-initiated runs before prompt()
+  //   3. try/catch — final safety net, swallows the error gracefully
   async function triggerInvisibleContinue() {
     if (!_agent) return;
-    await _agent.waitForIdle();
-    _agent.prompt([]);
+
+    // Guard 1: mutex — if a previous continue is still in-flight, skip
+    if (_continueInProgress) return;
+    _continueInProgress = true;
+
+    try {
+      await _agent.waitForIdle();
+
+      // Guard 2: pre-flight — the user may have sent a message while we
+      // waited for idle.  agent.state.isStreaming is authoritative (read
+      // directly from the activeRun field, no TOCTOU beyond the next line).
+      if (_agent.state.isStreaming) return;
+
+      try {
+        _agent.prompt([]);
+      } catch {
+        // Guard 3: catch the "already processing" error as a last resort.
+        // This handles the remaining microtask TOCTOU gap between the
+        // isStreaming check and prompt() acquiring the lock.
+      }
+    } finally {
+      _continueInProgress = false;
+    }
   }
 }
