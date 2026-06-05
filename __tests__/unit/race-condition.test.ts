@@ -318,6 +318,39 @@ describe("triggerInvisibleContinue race condition guards", () => {
     }
   });
 
+  it("restores the error assistant message if prompt fails", async () => {
+    const errorAssistant = {
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: "Connection error",
+      content: [],
+    } as unknown as AgentMessage;
+    const userMsg = {
+      role: "user",
+      content: [{ type: "text", text: "hello" }],
+    } as unknown as AgentMessage;
+
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() =>
+        Promise.reject(new Error("Agent is already processing a prompt")),
+      ),
+      messages: [userMsg, errorAssistant],
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      await advanceThroughRetry();
+
+      // prompt failed — the error assistant message should be restored
+      expect(agent.state.messages.length).toBe(2);
+      expect(agent.state.messages[1].role).toBe("assistant");
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
   it("/retry command also benefits from the guards", async () => {
     const { commands, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() =>
