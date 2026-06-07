@@ -43,12 +43,46 @@ import {
 // Capture the live Agent instance when AgentSession subscribes to it.
 // subscribe() is called during AgentSession construction — fires on both
 // fresh sessions and session resumes.
+//
+// We also monkey-patch continue() so the session's loop can never race
+// our retry.  Without this, observing isStreaming is a heuristic that
+// misses the narrow window between our check and the session's call.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _agent: Agent | null = null;
+
 const _origSubscribe = Agent.prototype.subscribe as (...args: any[]) => any;
 Agent.prototype.subscribe = function (this: Agent, ...args: any[]) {
   _agent = this;
   return _origSubscribe.apply(this, args);
+};
+
+// Monkey-patch continue() so the session's built-in retry loop cooperates
+// with our _continueInProgress mutex instead of throwing "Agent is already
+// processing" when we beat it to the punch.
+const _origContinue = Agent.prototype.continue as (this: Agent) => Promise<unknown>;
+Agent.prototype.continue = function (this: Agent) {
+  const self = this;
+  return (async () => {
+    // Wait while pi-retry is driving the agent so we don't double-dip.
+    while (_continueInProgress) {
+      await new Promise(r => setTimeout(r, 10));
+    }
+    try {
+      return await _origContinue.call(self);
+    } catch (e: any) {
+      // After pi-retry finishes, the transcript ends with a fresh
+      // assistant message.  The session's continue() sees this and
+      // would throw "Cannot continue from an assistant message".
+      // Catch it — the while-loop will poll _handlePostAgentRun()
+      // again, find no error, and exit cleanly.
+      const msg = e?.message ?? '';
+      if (msg.includes('Cannot continue from an assistant message') ||
+          msg.includes('Agent is already processing')) {
+        return;
+      }
+      throw e;
+    }
+  })();
 };
 
 // Per-category retry state (for diagnostics / messaging)
@@ -304,22 +338,11 @@ export default function (pi: ExtensionAPI) {
   // Resume the agent loop invisibly — no message injected into context.
   // The LLM sees the exact same message list it had before.
   //
-  // CRITICAL: We must wait until the SESSION has fully finished before we
-  // call prompt().  The agent_end event fires inside the current run, and
-  // the session's _runAgentPrompt loop may still call continue() after the
-  // run resolves (for built-in retries, compaction, etc.).  If we call
-  // prompt([]) while the session's continue() is about to run, one of
-  // them gets "Agent is already processing".
-  //
-  // The solution: wait for isStreaming to be false AND stay false across
-  // a microtask yield.  This ensures the session's loop has fully exited
-  // and won't call continue() under our feet.
-  //
-  // GUARDS (four layers):
-  //   1. _continueInProgress mutex — prevents concurrent calls from racing
-  //   2. waitForIdle + settle loop — waits for session to fully finish
-  //   3. isStreaming pre-flight — detects user-initiated runs before prompt()
-  //   4. .catch() on prompt() — final safety net, swallows rejected promises
+  // The continue() monkey-patch at the top of this file ensures the
+  // session's built-in retry loop can never race us.  While
+  // _continueInProgress is true, the session's continue() waits.
+  // When we finish, it wakes, finds the transcript already updated,
+  // gracefully no-ops, and the session loop exits.
   async function triggerInvisibleContinue() {
     if (!_agent) return;
 
@@ -328,44 +351,13 @@ export default function (pi: ExtensionAPI) {
     _continueInProgress = true;
 
     try {
-      // Guard 2: wait for the current run to finish, then verify the
-      // session has no further continue() calls pending.
-      //
-      // The session's _runAgentPrompt loop:
-      //   await agent.prompt(messages);
-      //   while (await _handlePostAgentRun()) { await agent.continue(); }
-      //
-      // waitForIdle() resolves when the FIRST run's activeRun is cleared.
-      // But the session may immediately start a new run via continue()
-      // (built-in retry, compaction).  We must keep waiting until
-      // isStreaming stays false across a microtask yield — that proves
-      // the session's loop has exited.
-      const MAX_SETTLE_ATTEMPTS = 50;
-      for (let i = 0; i < MAX_SETTLE_ATTEMPTS; i++) {
-        await _agent.waitForIdle();
-        if (!_agent.state.isStreaming) break;
-        // Session started another run (built-in retry, compaction) — wait
-        // for it to finish before checking again.
-      }
-      // Yield once more: if the session's _handlePostAgentRun returns true
-      // synchronously, the while loop will call continue() on the next
-      // microtask.  By yielding, we give it a chance to start that run
-      // so our next isStreaming check catches it.
-      await new Promise(r => setTimeout(r, 0));
-      if (_agent.state.isStreaming) {
-        // Session is handling the retry/compaction itself.  We don't need
-        // to do anything — it will emit its own agent_end when done, which
-        // may trigger this handler again for further retries.
-        return;
-      }
+      // Wait for the current run to finish (activeRun resolves in
+      // finishRun() after agent_end listeners return).
+      await _agent.waitForIdle();
 
-      // Guard 3: pre-flight — the user may have sent a message while we
-      // waited.  agent.state.isStreaming is authoritative.
-      if (_agent.state.isStreaming) return;
-
-      // Guard 4: .catch() swallows the "already processing" error as a
-      // last resort.  agent.prompt() is async, so errors become rejected
-      // Promises — a try/catch around an un-awaited call catches nothing.
+      // Fire-and-forget with .catch() as final safety net.
+      // The continue() monkey-patch means the session can't collide
+      // with us even if it tries — but .catch() is belt-and-suspenders.
       _agent.prompt([]).catch(() => {});
     } finally {
       _continueInProgress = false;
