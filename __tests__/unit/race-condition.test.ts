@@ -6,7 +6,8 @@
  *   2. continue() monkey-patch — session's continue() waits while our
  *      retry is in-flight, then gracefully no-ops.  Eliminates "Agent is
  *      already processing" errors at the source.
- *   3. .catch() on prompt() — final safety net, swallows rejected promises
+ *   3. await prompt() + try/catch — holds the mutex for the full retry so
+ *      the session stays alive and the UI shows "Working…" until done.
  *
  * The retry handler sleeps with exponential backoff before calling
  * triggerInvisibleContinue.  We use vi.useFakeTimers() to fast-forward
@@ -172,7 +173,7 @@ describe("triggerInvisibleContinue race condition guards", () => {
     }
   });
 
-  it("Guard 3 (.catch): swallows 'already processing' rejected promise from prompt()", async () => {
+  it("try/catch around await prompt() swallows rejections", async () => {
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() =>
         Promise.reject(new Error("Agent is already processing a prompt")),

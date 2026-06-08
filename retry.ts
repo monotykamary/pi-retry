@@ -355,10 +355,16 @@ export default function (pi: ExtensionAPI) {
       // finishRun() after agent_end listeners return).
       await _agent.waitForIdle();
 
-      // Fire-and-forget with .catch() as final safety net.
-      // The continue() monkey-patch means the session can't collide
-      // with us even if it tries — but .catch() is belt-and-suspenders.
-      _agent.prompt([]).catch(() => {});
+      try {
+        // Await so _continueInProgress stays true for the full retry.
+        // The session's continue() is blocked (monkey-patch) and the
+        // session's _runAgentPrompt stays alive, keeping the UI
+        // "Working…" until the agent is actually done.
+        await _agent.prompt([]);
+      } catch {
+        // Ignore — if prompt throws, something else is driving.
+        // The session will handle it or report the error.
+      }
     } finally {
       _continueInProgress = false;
     }
