@@ -10,6 +10,7 @@ import {
   hasConnectionError,
   hasRetryableError,
   isNonRetryableError,
+  isSilencedError,
   hasMaxTokensStop,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
@@ -209,6 +210,11 @@ describe('isNonRetryableError', () => {
     expect(isNonRetryableError(msg)).toBe(true);
   });
 
+  it('detects "cannot continue from message role" errors', () => {
+    const msg = createAssistantError('Cannot continue from message role: assistant');
+    expect(isNonRetryableError(msg)).toBe(true);
+  });
+
   it('returns false for retryable errors', () => {
     const msg = createAssistantError('Connection error');
     expect(isNonRetryableError(msg)).toBe(false);
@@ -217,6 +223,31 @@ describe('isNonRetryableError', () => {
   it('returns false for non-error messages', () => {
     const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
     expect(isNonRetryableError(msg)).toBe(false);
+  });
+});
+
+describe('isSilencedError', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  it('silences "cannot continue from message role" errors', () => {
+    const msg = createAssistantError('Cannot continue from message role: assistant');
+    expect(isSilencedError(msg)).toBe(true);
+  });
+
+  it('does not silence invalid API key errors', () => {
+    const msg = createAssistantError('Invalid API key provided');
+    expect(isSilencedError(msg)).toBe(false);
+  });
+
+  it('does not silence model not found errors', () => {
+    const msg = createAssistantError('Model not found: gpt-99');
+    expect(isSilencedError(msg)).toBe(false);
+  });
+
+  it('returns false for non-error messages', () => {
+    const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
+    expect(isSilencedError(msg)).toBe(false);
   });
 });
 

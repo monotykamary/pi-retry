@@ -6,6 +6,7 @@ import {
   hasConnectionError,
   hasRetryableError,
   isNonRetryableError,
+  isSilencedError,
   hasMaxTokensStop,
   isAssistantMessage,
   getLastAssistantMessage,
@@ -191,7 +192,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Log non-retryable errors so the user knows why we didn't retry
-    if (isNonRetryableError(lastAssistant)) {
+    // (silenced errors are neither retried nor shown)
+    if (isNonRetryableError(lastAssistant) && !isSilencedError(lastAssistant)) {
       const errorMsg = lastAssistant.errorMessage || "Unknown error";
       ctx.ui.notify(`Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`, "error");
     }

@@ -75,6 +75,12 @@ const NON_RETRYABLE_PATTERNS = [
   /no\s*such\s*model/i,
   /model\s*does\s*not\s*exist/i,
   /unsupported\s*model/i,
+  /cannot continue from message role/i,
+];
+
+// Errors that are non-retryable AND should be silently ignored (no notification)
+const SILENCED_PATTERNS = [
+  /cannot continue from message role/i,
 ];
 
 // ── Type guard ──
@@ -122,6 +128,17 @@ export function isNonRetryableError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
   return NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage));
+}
+
+/**
+ * Returns true for errors that are non-retryable and should be silently
+ * ignored (no UI notification). These are provider-level refusals that
+ * the user cannot act on and that would only add noise.
+ */
+export function isSilencedError(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  return SILENCED_PATTERNS.some(p => p.test(message.errorMessage));
 }
 
 // ── Categorisation (for UI messages) ──
