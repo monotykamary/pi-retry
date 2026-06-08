@@ -77,7 +77,8 @@ Agent.prototype.continue = function (this: Agent) {
       // Catch it — the while-loop will poll _handlePostAgentRun()
       // again, find no error, and exit cleanly.
       const msg = e?.message ?? '';
-      if (msg.includes('Cannot continue from an assistant message') ||
+      if (msg.includes('Cannot continue from message role') ||
+          msg.includes('Cannot continue from an assistant message') ||
           msg.includes('Agent is already processing')) {
         return;
       }
