@@ -123,6 +123,11 @@ const stateOther = new RetryState();
 // Max_tokens continuation state (indefinite — no cap needed)
 const stateContinuation = new ContinuationState();
 
+// Abort flag: set when turn_end reports stopReason "aborted", cleared on
+// session_start and on fresh user activity.  Prevents triggerInvisibleContinue()
+// from driving a new prompt([]) after the user explicitly cancelled.
+let _userAborted = false;
+
 // Mutex: only one triggerInvisibleContinue may be in-flight at a time.
 // Without this, concurrent agent_end events (or a manual /retry during an
 // automatic retry) race through waitForIdle() and both call prompt([]),
@@ -155,6 +160,9 @@ export default function (pi: ExtensionAPI) {
         // Do NOT reset continuation state — a user abort of a continuation
         // turn is different from aborting an error retry.
         stateContinuation.endContinuation();
+        // Signal to any in-flight triggerInvisibleContinue or pending retry
+        // that the user has cancelled — don't drive a new prompt([]).
+        _userAborted = true;
         return;
       }
       if (msg.stopReason !== "length") {
@@ -164,6 +172,9 @@ export default function (pi: ExtensionAPI) {
         stateConnection.succeed();
         stateOther.succeed();
         stateContinuation.complete();
+        // Clear abort flag — this is a fresh successful turn, so any
+        // previous abort is stale and shouldn't block future retries.
+        _userAborted = false;
       }
     }
   });
@@ -176,6 +187,9 @@ export default function (pi: ExtensionAPI) {
     if (!lastAssistant || !isAssistantMessage(lastAssistant)) {
       return;
     }
+
+    // Guard: if the user aborted, don't drive any new prompt([])
+    if (_userAborted) return;
 
     // Check for max_tokens stop — auto-continue (invisible to LLM)
     if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
@@ -218,6 +232,15 @@ export default function (pi: ExtensionAPI) {
       const delay = calculateDelay(state.getAttempt());
 
       await sleep(delay);
+
+      // Re-check: user may have aborted during the backoff sleep.
+      // turn_end with stopReason "aborted" sets _userAborted, but this
+      // handler was already past the initial check.
+      if (_userAborted) {
+        state.endRetry();
+        return;
+      }
+
       // Must NOT await — see triggerInvisibleContinue() for explanation
       void triggerInvisibleContinue();
       state.endRetry();
@@ -305,6 +328,7 @@ export default function (pi: ExtensionAPI) {
         stateConnection.reset();
         stateOther.reset();
         stateContinuation.reset();
+        _userAborted = false;
         ctx.ui.notify("All retry counters reset", "info");
         return;
       }
@@ -317,6 +341,10 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("No assistant message found to retry", "warning");
         return;
       }
+
+      // Manual /retry overrides any previous abort — the user is
+      // explicitly requesting a retry, so clear the abort flag.
+      _userAborted = false;
 
       // Auto-detect: max_tokens continuation takes priority
       if (hasMaxTokensStop(lastAssistant)) {
@@ -369,6 +397,7 @@ export default function (pi: ExtensionAPI) {
     stateContinuation.reset();
     _continueInProgress = false;
     _lastInvisibleContinueTime = 0;
+    _userAborted = false;
   });
 
   // Resume the agent loop invisibly — no message injected into context.
@@ -382,6 +411,12 @@ export default function (pi: ExtensionAPI) {
   async function triggerInvisibleContinue() {
     if (!_agent) return;
 
+    // Guard 0: if the user aborted, don't drive a new prompt([]).
+    // This catches aborts that happened between agent_end firing and
+    // this async function actually executing (e.g. during backoff sleep
+    // or while waitForIdle was pending).
+    if (_userAborted) return;
+
     // Guard 1: mutex — if a previous continue is still in-flight, skip
     if (_continueInProgress) return;
     _continueInProgress = true;
@@ -390,6 +425,10 @@ export default function (pi: ExtensionAPI) {
       // Wait for the current run to finish (activeRun resolves in
       // finishRun() after agent_end listeners return).
       await _agent.waitForIdle();
+
+      // Re-check after waitForIdle: the user may have aborted while
+      // we were waiting for the agent to become idle.
+      if (_userAborted) return;
 
       try {
         // Await so _continueInProgress stays true for the full retry.
