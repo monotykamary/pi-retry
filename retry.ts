@@ -90,7 +90,9 @@ Agent.prototype.continue = function (this: Agent) {
             lastMsg.stopReason !== 'stop' &&
             lastMsg.stopReason !== 'aborted') {
           // Agent was mid-task (toolUse, length, or error) — fall back to prompt([])
-          if (!_continueInProgress) {
+          // Guard: if triggerInvisibleContinue() just completed (within 500ms),
+          // the agent already continued — skip to avoid double continuation.
+          if (!_continueInProgress && Date.now() - _lastInvisibleContinueTime > 500) {
             _continueInProgress = true;
             try {
               await self.prompt([]);
@@ -126,6 +128,11 @@ const stateContinuation = new ContinuationState();
 // automatic retry) race through waitForIdle() and both call prompt([]),
 // producing "Agent is already processing".
 let _continueInProgress = false;
+
+// Timestamp of the last completed triggerInvisibleContinue().
+// Used by the continue() monkey-patch to avoid double continuation when
+// triggerInvisibleContinue just ran and the session's continue() unblocks.
+let _lastInvisibleContinueTime = 0;
 
 // Sleep helper
 function sleep(ms: number): Promise<void> {
@@ -361,6 +368,7 @@ export default function (pi: ExtensionAPI) {
     stateOther.reset();
     stateContinuation.reset();
     _continueInProgress = false;
+    _lastInvisibleContinueTime = 0;
   });
 
   // Resume the agent loop invisibly — no message injected into context.
@@ -395,6 +403,10 @@ export default function (pi: ExtensionAPI) {
       }
     } finally {
       _continueInProgress = false;
+      // Record completion time so the continue() monkey-patch can
+      // detect that an invisible continue just ran and avoid firing
+      // a duplicate prompt([]) (RC7: double continuation guard).
+      _lastInvisibleContinueTime = Date.now();
     }
   }
 }
