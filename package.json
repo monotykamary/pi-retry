@@ -1,6 +1,6 @@
 {
   "name": "@monotykamary/pi-retry",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Extension suite for pi coding agent that handles 400/413 errors and connection errors with automatic retry",
   "type": "module",
   "author": "Tom X Nguyen",
@@ -40,7 +40,7 @@
     "lint:dead": "knip --no-gitignore"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.75.4",
+    "@earendil-works/pi-agent-core": "^0.75.4",
     "@earendil-works/pi-coding-agent": "0.75.4",
     "@types/node": "25.9.1",
     "@vitest/coverage-v8": "4.1.7",

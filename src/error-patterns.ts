@@ -118,7 +118,7 @@ export function hasConnectionError(message: AgentMessage): boolean {
 export function hasRetryableError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return !NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage));
+  return !NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 /**
@@ -127,7 +127,7 @@ export function hasRetryableError(message: AgentMessage): boolean {
 export function isNonRetryableError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage));
+  return NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 /**
@@ -138,7 +138,7 @@ export function isNonRetryableError(message: AgentMessage): boolean {
 export function isSilencedError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return SILENCED_PATTERNS.some(p => p.test(message.errorMessage));
+  return SILENCED_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 // ── Categorisation (for UI messages) ──
