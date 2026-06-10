@@ -1,15 +1,15 @@
 {
   "name": "@monotykamary/pi-retry",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "@monotykamary/pi-retry",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "license": "MIT",
       "devDependencies": {
-        "@earendil-works/pi-agent-core": "^0.75.4",
+        "@earendil-works/pi-agent-core": "^0.79.1",
         "@earendil-works/pi-coding-agent": "0.75.4",
         "@types/node": "25.9.1",
         "@vitest/coverage-v8": "4.1.7",
@@ -577,13 +577,13 @@
       }
     },
     "node_modules/@earendil-works/pi-agent-core": {
-      "version": "0.75.4",
-      "resolved": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.75.4.tgz",
-      "integrity": "sha512-cGYbysb4EqUf0B28OeqFq2ppm1XF3bYBOP71q9dv38yf/UJfzMjiXBeNelrcio+QWIoVrW+xzYm7sMzYIUc9Og==",
+      "version": "0.79.1",
+      "resolved": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.79.1.tgz",
+      "integrity": "sha512-PBPjBa2YBm9jauiLtHAKaSfVJ4Dvm3/nK/bR/oHebLjwBCS2tGx3aQDX7MSGAOXi6BejlhzbB/z82BkyAyNjjQ==",
       "dev": true,
       "license": "MIT",
       "dependencies": {
-        "@earendil-works/pi-ai": "^0.75.4",
+        "@earendil-works/pi-ai": "^0.79.1",
         "ignore": "7.0.5",
         "typebox": "1.1.38",
         "yaml": "2.9.0"
@@ -593,9 +593,9 @@
       }
     },
     "node_modules/@earendil-works/pi-ai": {
-      "version": "0.75.5",
-      "resolved": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-0.75.5.tgz",
-      "integrity": "sha512-zf1F5kXk1pqZeFShXOqq9ibUk8QdtRoLCDPAjO+hj44e3EUs9/GFO2qnhTC5+JA2uwVCx+WCNe1PiCjlBYWm5w==",
+      "version": "0.79.1",
+      "resolved": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-0.79.1.tgz",
+      "integrity": "sha512-UnORwrcsTNLm4StEvoM8iEom0u87Te7BXEWxhec3iNXygWD6eEBosUoq9ddcveqtj/QpUZBMPWUu81cCtZxzkQ==",
       "dev": true,
       "license": "MIT",
       "dependencies": {
