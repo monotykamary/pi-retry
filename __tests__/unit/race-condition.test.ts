@@ -265,40 +265,37 @@ describe("triggerInvisibleContinue retry loop", () => {
     }
   });
 
-  it("session_start resets counters, but in-flight loop continues", async () => {
-    let resolveIdle!: () => void;
+  it("session_start kills in-flight retry loop via generation counter", async () => {
+    let promptCount = 0;
     const { handlers, agent, restore } = await setup({
-      waitForIdle: vi.fn().mockImplementation(
-        () => new Promise<void>((r) => { resolveIdle = r; }),
-      ),
+      prompt: vi.fn().mockImplementation(() => {
+        promptCount++;
+        agent.state.messages = [
+          { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+        ];
+        return Promise.resolve();
+      }),
     });
     try {
       const entries = [errorEntry("Connection error")];
 
       fireAgentEndAsync(handlers, entries);
-      // Advance past the waitForIdle yield point
-      await vi.advanceTimersByTimeAsync(100);
+      // Advance through the 2s backoff so the first prompt fires
+      await advanceThroughRetry(3000);
 
-      // Fire session_start — it resets _continueInProgress to false
+      const countBefore = promptCount;
+
+      // Fire session_start — increments generation, killing the loop
       const sessionHandlers = handlers["session_start"] ?? [];
       for (const fn of sessionHandlers) {
         await fn({}, createMockCtx());
       }
 
-      // Resolve waitForIdle so the loop can proceed
-      resolveIdle();
-      await vi.advanceTimersByTimeAsync(0);
+      // Advance a long time — the loop should have exited
+      await advanceThroughRetry(60000);
 
-      // Now the loop is running with _continueInProgress=true again
-      // (it was reset by session_start but the loop set it again when it
-      // continued). Give it time to complete.
-      agent.waitForIdle = vi.fn().mockResolvedValue(undefined);
-      agent.prompt = vi.fn().mockResolvedValue(undefined);
-
-      await advanceThroughRetry(5000);
-
-      // The in-flight loop should have completed and called prompt
-      expect(agent.prompt).toHaveBeenCalled();
+      // No new prompt calls should have happened after session_start
+      expect(promptCount).toBe(countBefore);
     } finally {
       restore();
     }
@@ -631,6 +628,202 @@ describe("RetryState tracking in retry loop", () => {
       await advanceThroughRetry(35000);
 
       expect(promptCount).toBeGreaterThanOrEqual(4);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// ── Bug: ESC abort not responsive / /new continues retrying ──
+
+describe("interruptible abort and session change", () => {
+  it("ESC aborts during backoff sleep within 100ms", async () => {
+    let promptCount = 0;
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() => {
+        promptCount++;
+        agent.state.messages = [
+          { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+        ];
+        return Promise.resolve();
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      // Advance through the first prompt (2s backoff)
+      await advanceThroughRetry(3000);
+      const countBefore = promptCount;
+
+      // Abort sets _userAborted = true
+      const turnEndHandlers = handlers["turn_end"] ?? [];
+      const ctx = createMockCtx([]);
+      for (const fn of turnEndHandlers) {
+        await fn({ message: { role: "assistant", stopReason: "aborted" } }, ctx);
+      }
+
+      // Only 200ms should be needed for the interruptible sleep to detect the abort
+      // (it polls every 100ms). Before the fix, we'd need to wait the full backoff.
+      await advanceThroughRetry(200);
+
+      // No more prompt calls after abort detected during backoff sleep
+      expect(promptCount).toBe(countBefore);
+    } finally {
+      restore();
+    }
+  });
+
+  it("ESC abort detected after prompt([]) returns", async () => {
+    let promptCount = 0;
+    let resolvePrompt!: () => void;
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() => {
+        promptCount++;
+        return new Promise<void>((resolve) => { resolvePrompt = resolve; });
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      // Advance through the 2s backoff to start the prompt
+      await advanceThroughRetry(3000);
+      expect(promptCount).toBe(1);
+
+      // While prompt is in-flight, fire the abort
+      const turnEndHandlers = handlers["turn_end"] ?? [];
+      const ctx = createMockCtx([]);
+      for (const fn of turnEndHandlers) {
+        await fn({ message: { role: "assistant", stopReason: "aborted" } }, ctx);
+      }
+
+      // Now resolve the prompt (simulating the prompt returning after abort)
+      agent.state.messages = [
+        { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+      ];
+      resolvePrompt();
+      await advanceThroughRetry(5000);
+
+      // The post-prompt check should have seen _userAborted and exited
+      expect(promptCount).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("/new (session_start) stops in-flight retry loop", async () => {
+    let promptCount = 0;
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() => {
+        promptCount++;
+        agent.state.messages = [
+          { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+        ];
+        return Promise.resolve();
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      // Advance through the first retry (2s backoff)
+      await advanceThroughRetry(3000);
+      expect(promptCount).toBeGreaterThanOrEqual(1);
+
+      const countBefore = promptCount;
+
+      // Fire session_start (simulates /new)
+      const sessionHandlers = handlers["session_start"] ?? [];
+      for (const fn of sessionHandlers) {
+        await fn({}, createMockCtx());
+      }
+
+      // Advance a long time — the generation counter should have killed the loop
+      await advanceThroughRetry(60000);
+
+      // No more prompts after session_start
+      expect(promptCount).toBe(countBefore);
+    } finally {
+      restore();
+    }
+  });
+
+  it("/new during backoff sleep exits within 100ms", async () => {
+    let promptCount = 0;
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() => {
+        promptCount++;
+        agent.state.messages = [
+          { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+        ];
+        return Promise.resolve();
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      // Advance through the first prompt
+      await advanceThroughRetry(3000);
+      const countBefore = promptCount;
+
+      // Fire session_start during the second backoff sleep
+      const sessionHandlers = handlers["session_start"] ?? [];
+      for (const fn of sessionHandlers) {
+        await fn({}, createMockCtx());
+      }
+
+      // Only 200ms needed — interruptibleSleep polls every 100ms
+      await advanceThroughRetry(200);
+
+      // Loop should have exited, no more prompts
+      expect(promptCount).toBe(countBefore);
+    } finally {
+      restore();
+    }
+  });
+
+  it("finally block does not clobber _continueInProgress on generation change", async () => {
+    let promptCount = 0;
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() => {
+        promptCount++;
+        agent.state.messages = [
+          { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+        ];
+        return Promise.resolve();
+      }),
+    });
+    try {
+      const entries = [errorEntry("Connection error")];
+      fireAgentEndAsync(handlers, entries);
+
+      // Advance through the first prompt
+      await advanceThroughRetry(3000);
+
+      // Fire session_start — increments generation
+      const sessionHandlers = handlers["session_start"] ?? [];
+      for (const fn of sessionHandlers) {
+        await fn({}, createMockCtx());
+      }
+
+      // Let the old loop's finally block run
+      await advanceThroughRetry(500);
+
+      // Now fire a new error on the new session
+      const newEntries = [errorEntry("Connection error")];
+      const newCtx = createMockCtx(newEntries);
+      const fns = handlers["agent_end"] ?? [];
+      for (const fn of fns) {
+        void fn({ messages: [] }, newCtx);
+      }
+
+      // Advance through backoff — the new retry should start
+      await advanceThroughRetry(3000);
+
+      // A new prompt should have been called (from the new session's retry)
+      expect(agent.prompt).toHaveBeenCalled();
     } finally {
       restore();
     }

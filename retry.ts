@@ -169,10 +169,30 @@ let _continueInProgress = false;
 // triggerInvisibleContinue just ran and the session's continue() unblocks.
 let _lastInvisibleContinueTime = 0;
 
-// Sleep helper (non-abortable — used inside the retry loop outside
-// processEvents where no abort signal is available)
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// Session generation counter: incremented on every session_start.
+// The retry loop captures the current generation when it starts and exits
+// when it changes — this handles /new and other session switches.
+let _sessionGeneration = 0;
+
+// Interruptible sleep: polls _userAborted and _sessionGeneration every
+// 100ms.  Returns true if interrupted (abort or session change), false if
+// the full delay elapsed normally.
+function interruptibleSleep(ms: number, generation: number): Promise<boolean> {
+  if (ms <= 0) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const checkInterval = 100;
+    let elapsed = 0;
+    const timer = setInterval(() => {
+      elapsed += checkInterval;
+      if (_userAborted || _sessionGeneration !== generation) {
+        clearInterval(timer);
+        resolve(true);
+      } else if (elapsed >= ms) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, checkInterval);
+  });
 }
 
 // Remove the error assistant message at the end of agent state, if present.
@@ -442,12 +462,20 @@ export default function (pi: ExtensionAPI) {
 
   // Initialize
   pi.on("session_start", async () => {
+    // Bump the generation counter so any in-flight retry loop from a
+    // previous session exits on its next checkpoint (within 100ms during
+    // backoff sleep, or immediately after prompt([]) returns).
+    _sessionGeneration++;
+
     state400.reset();
     stateCredit.reset();
     stateConnection.reset();
     stateOther.reset();
     stateContinuation.reset();
-    _continueInProgress = false;
+    // Do NOT reset _continueInProgress here — the in-flight loop's
+    // finally block handles it conditionally (only if the generation
+    // hasn't changed since the loop started).  Resetting it here would
+    // break the mutex invariant and could allow a second loop to start.
     _lastInvisibleContinueTime = 0;
     _userAborted = false;
   });
@@ -477,20 +505,24 @@ export default function (pi: ExtensionAPI) {
     if (_continueInProgress) return;
     _continueInProgress = true;
 
+    // Capture the current session generation. If /new fires while we're
+    // looping, _sessionGeneration will increment and the loop will exit.
+    const myGeneration = _sessionGeneration;
+
     try {
       // Wait for the current run to finish (activeRun resolves in
       // finishRun() after agent_end listeners return).
       await _agent.waitForIdle();
 
-      // Re-check after waitForIdle: the user may have aborted while
-      // we were waiting for the agent to become idle.
-      if (_userAborted) return;
+      // Re-check after waitForIdle: the user may have aborted or the
+      // session may have changed while we were waiting.
+      if (_userAborted || _sessionGeneration !== myGeneration) return;
 
       let attempt = 0;
 
-      // Loop until success or abort.
+      // Loop until success, abort, or session change.
       while (true) {
-        if (_userAborted) return;
+        if (_userAborted || _sessionGeneration !== myGeneration) return;
 
         // Remove the error assistant message from agent state so
         // prompt([]) sends a clean context to the LLM.
@@ -502,14 +534,12 @@ export default function (pi: ExtensionAPI) {
         // Notify the user about the upcoming retry attempt.
         _notifyRetryAttempt(attempt, delay);
 
-        // Sleep with backoff BEFORE the retry attempt.
-        // This matches the built-in retry's UX: "Retrying (attempt N) in Xs..."
-        // The sleep is safe: we are outside processEvents, the agent is
-        // idle, and the user can press Escape to abort.
-        await sleep(delay);
-
-        // Re-check after sleep — user may have aborted during backoff.
-        if (_userAborted) return;
+        // Interruptible sleep with backoff BEFORE the retry attempt.
+        // Polls _userAborted and _sessionGeneration every 100ms so ESC
+        // and /new take effect within 100ms instead of waiting for the
+        // full backoff (up to 60s).
+        const interrupted = await interruptibleSleep(delay, myGeneration);
+        if (interrupted) return;
 
         try {
           await _agent.prompt([]);
@@ -518,6 +548,10 @@ export default function (pi: ExtensionAPI) {
           // the session or another driver is handling it.
           return;
         }
+
+        // Re-check after prompt: the user may have hit ESC during the
+        // prompt, or /new may have fired — don't keep retrying.
+        if (_userAborted || _sessionGeneration !== myGeneration) return;
 
         // prompt([]) completed. Check the result.
         if (!lastMessageIsRetryableError()) {
@@ -528,7 +562,12 @@ export default function (pi: ExtensionAPI) {
         // Error again — loop back for another attempt.
       }
     } finally {
-      _continueInProgress = false;
+      // Only reset the mutex if the session hasn't changed since we
+      // started.  If /new fired, a new retry loop may already own the
+      // mutex — resetting it here would clobber that.
+      if (_sessionGeneration === myGeneration) {
+        _continueInProgress = false;
+      }
       _lastInvisibleContinueTime = Date.now();
     }
   }

@@ -613,3 +613,150 @@ describe("smoke: built-in retry suppression", () => {
     }
   });
 });
+
+// ── Critical: ESC and /new responsiveness ──
+
+describe("smoke: interruptible abort and session change", () => {
+  it("ESC aborts quickly — not after the full backoff", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      let promptCount = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          promptCount++;
+          agent.state.messages = [
+            { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+          ];
+          return Promise.resolve();
+        })
+      );
+
+      const entries = [errorEntry("Connection error")];
+      const ctx = createMockCtx(entries);
+
+      const fns = handlers["agent_end"] ?? [];
+      for (const fn of fns) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      // Advance through the first prompt (2s backoff)
+      await advance(3000);
+      const countBefore = promptCount;
+
+      // Fire abort
+      const turnEndFns = handlers["turn_end"] ?? [];
+      const abortCtx = createMockCtx([]);
+      for (const fn of turnEndFns) {
+        await fn({ message: { role: "assistant", stopReason: "aborted" } }, abortCtx);
+      }
+
+      // Only 200ms needed — interruptibleSleep polls every 100ms
+      await advance(200);
+
+      // No more prompts after abort
+      expect(promptCount).toBe(countBefore);
+    } finally {
+      restore();
+    }
+  });
+
+  it("/new stops the retry loop", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      let promptCount = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          promptCount++;
+          agent.state.messages = [
+            { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+          ];
+          return Promise.resolve();
+        })
+      );
+
+      const entries = [errorEntry("Connection error")];
+      const ctx = createMockCtx(entries);
+
+      const fns = handlers["agent_end"] ?? [];
+      for (const fn of fns) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      // Advance through the first prompt
+      await advance(3000);
+      const countBefore = promptCount;
+
+      // Fire session_start (simulates /new)
+      const sessionFns = handlers["session_start"] ?? [];
+      for (const fn of sessionFns) {
+        await fn({}, createMockCtx());
+      }
+
+      // Advance a long time — the loop should have exited
+      await advance(60000);
+
+      // No more prompts after session_start
+      expect(promptCount).toBe(countBefore);
+    } finally {
+      restore();
+    }
+  });
+
+  it("new session can start its own retry after /new", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      let promptCount = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          promptCount++;
+          if (promptCount >= 3) {
+            agent.state.messages = [
+              { role: "assistant", stopReason: "stop", content: [] },
+            ];
+          } else {
+            agent.state.messages = [
+              { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+            ];
+          }
+          return Promise.resolve();
+        })
+      );
+
+      const entries = [errorEntry("Connection error")];
+      const ctx = createMockCtx(entries);
+
+      // Start retry on session 1
+      const fns = handlers["agent_end"] ?? [];
+      for (const fn of fns) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      await advance(3000);
+
+      // Fire /new — kills the old loop
+      const sessionFns = handlers["session_start"] ?? [];
+      for (const fn of sessionFns) {
+        await fn({}, createMockCtx());
+      }
+
+      await advance(500);
+
+      // Now fire a new error on the new session
+      const newCtx = createMockCtx(entries);
+      for (const fn of fns) {
+        void fn({ messages: [] }, newCtx);
+      }
+
+      // Advance through backoff + retry
+      await advance(10000);
+
+      // The new session's retry should have fired
+      expect(agent.prompt).toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+});
