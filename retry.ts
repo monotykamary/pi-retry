@@ -73,6 +73,10 @@ Agent.prototype.subscribe = function (this: Agent, ...args: any[]) {
 // with our _continueInProgress mutex AND can convert the "Cannot continue
 // from assistant" error into a prompt([]) call when the agent was mid-task
 // (compaction, toolUse, length — but NOT error, which the loop handles).
+//
+// Note (pi 0.79+): Agent.continue() now drains queued steering/follow-up
+// messages before throwing, so this throw path only fires when there are
+// genuinely no queued messages — the prompt([]) fallback is still correct.
 const _origContinue = Agent.prototype.continue as (this: Agent) => Promise<void>;
 Agent.prototype.continue = function (this: Agent) {
   const self = this;
