@@ -9,6 +9,7 @@ import {
   isNonRetryableError,
   isSilencedError,
   hasMaxTokensStop,
+  isContextOverflowError,
   isAssistantMessage,
   getLastAssistantMessage,
   calculateDelay,
@@ -290,6 +291,30 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Context overflow: defer to compaction. Do NOT retry here.
+    //
+    // triggerInvisibleContinue() calls agent.prompt([]) directly on the core
+    // Agent, bypassing AgentSession._handlePostAgentRun → _checkCompaction, so
+    // a pi-retry retry loop gets NO compaction. Retrying an overflow would
+    // re-send the same oversized context → overflow again → infinite loop
+    // (pi-retry's error loop is uncapped). Meanwhile pi-retry's _continueInProgress
+    // mutex would block pi-core's own compaction-retry (agent.continue()), so
+    // pi-core never gets to compact either.
+    //
+    // Instead, return without firing triggerInvisibleContinue. pi-core's
+    // _checkCompaction (which runs in _handlePostAgentRun regardless of
+    // extensions) detects the same overflow, compacts (statically via pi-vcc
+    // when installed), and retries once via agent.continue() with the reduced
+    // context. _continueInProgress stays false, so pi-core's continue is
+    // unblocked.
+    if (isContextOverflowError(lastAssistant)) {
+      ctx.ui.notify(
+        "Context overflow — deferring to compaction (auto-retry after compact).",
+        "info",
+      );
+      return;
+    }
+
     // Catch-all: retry ANY error except known permanent failures
     if (hasRetryableError(lastAssistant)) {
       const errorMsg = lastAssistant.errorMessage || "Unknown error";
@@ -426,6 +451,17 @@ export default function (pi: ExtensionAPI) {
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
         void triggerInvisibleContinue();
+        return;
+      }
+
+      // Context overflow: don't retry in place — reducing context is required.
+      // Compaction (pi-vcc / /compact) handles it and auto-retries. Retrying
+      // without compaction loops forever on a genuinely oversized payload.
+      if (isContextOverflowError(lastAssistant)) {
+        ctx.ui.notify(
+          "Context overflow — use /compact (or /pi-vcc) to reduce context. Compaction auto-retries.",
+          "info",
+        );
         return;
       }
 

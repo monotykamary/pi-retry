@@ -64,6 +64,51 @@ const BUILTIN_HANDLED_PATTERNS = [
   /retry\s*delay/i,
 ];
 
+// Context-overflow error patterns. Mirrors pi-core's OVERFLOW_PATTERNS in
+// @earendil-works/pi-ai/dist/utils/overflow.js so that pi-retry defers to
+// compaction exactly when pi-core's _checkCompaction will detect overflow and
+// compact + retry. kept in sync manually — pi-ai is not a direct dependency.
+//
+// Why these are NOT retried by pi-retry: retrying an overflow via prompt([])
+// re-sends the same oversized context, so it overflows again → infinite loop
+// (pi-retry's loop is uncapped for errors). pi-core instead compacts and
+// retries once via agent.continue(); with static compaction (pi-vcc) that
+// reliably reduces context, so the single retry succeeds.
+const OVERFLOW_ERROR_PATTERNS = [
+  /prompt is too long/i,
+  /request_too_large/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /too large for model with \d+ maximum context length/i,
+  /model_context_window_exceeded/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+  /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i,
+];
+
+// Patterns that look like overflow but are actually rate limiting / throttling.
+// Mirrors pi-core's NON_OVERFLOW_PATTERNS. Excluded from overflow detection so
+// throttling errors are still retried (they are not context-size problems).
+const NON_OVERFLOW_PATTERNS = [
+  /^(Throttling error|Service unavailable):/i,
+  /rate limit/i,
+  /too many requests/i,
+];
+
 // ── Blacklist: errors that are truly permanent and should NOT be retried ──
 
 const NON_RETRYABLE_PATTERNS = [
@@ -107,6 +152,24 @@ export function hasConnectionError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
   return CONNECTION_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
+}
+
+/**
+ * Returns true for an error assistant message whose errorMessage indicates a
+ * context-overflow (input exceeded the model's context window).
+ *
+ * Mirrors pi-core's isContextOverflow Case 1 (error-message patterns). The
+ * silent-overflow cases (stopReason "stop"/"length") are not errors and are
+ * never seen here — pi-core handles those in _checkCompaction directly.
+ *
+ * Callers should treat a true result as "defer to compaction, do NOT retry" —
+ * see OVERFLOW_ERROR_PATTERNS for rationale.
+ */
+export function isContextOverflowError(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  if (NON_OVERFLOW_PATTERNS.some(p => p.test(message.errorMessage!))) return false;
+  return OVERFLOW_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 // ── Universal retry check ──

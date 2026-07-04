@@ -12,6 +12,7 @@ import {
   isNonRetryableError,
   isSilencedError,
   hasMaxTokensStop,
+  isContextOverflowError,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
 } from '../../src/error-patterns.js';
@@ -163,6 +164,80 @@ describe('hasConnectionError', () => {
   it('returns false for user messages', () => {
     const msg = { role: 'user', content: [{ type: 'text', text: 'test' }] } as unknown as AgentMessage;
     expect(hasConnectionError(msg)).toBe(false);
+  });
+});
+
+describe('isContextOverflowError', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  // Mirrors pi-core's isContextOverflow Case 1 patterns. These are the errors
+  // pi-retry must NOT retry (defer to compaction) — see error-patterns.ts.
+  const overflowCases = [
+    'prompt is too long: 213462 tokens > 200000 maximum',
+    'request_too_large: Request exceeds the maximum size',
+    'Your input exceeds the context window of this model',
+    'Requested token count exceeds the model\'s maximum context length of 131072 tokens',
+    'The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)',
+    'This model\'s maximum prompt length is 131072 but the request contains 537812 tokens',
+    'Please reduce the length of the messages or completion',
+    'This endpoint\'s maximum context length is 131072 tokens. However, you requested about 265330 tokens',
+    'Input length (265330) exceeds model\'s maximum context length (262144).',
+    'prompt token count of 265330 exceeds the limit of 262144',
+    'invalid params, context window exceeds limit',
+    'Your request exceeded model token limit: 200000 (requested: 213462)',
+    'Prompt contains 213462 tokens ... too large for model with 200000 maximum context length',
+    'model_context_window_exceeded',
+    'prompt too long; exceeded max context length by 13462 tokens',
+    'context_length_exceeded',
+    'too many tokens',
+    'token limit exceeded',
+    '400 (no body)',
+    '413 (no body)',
+  ];
+
+  overflowCases.forEach((pattern) => {
+    it(`detects overflow "${pattern.slice(0, 50)}"`, () => {
+      const msg = createAssistantError(pattern);
+      expect(isContextOverflowError(msg)).toBe(true);
+    });
+  });
+
+  // Throttling / rate-limit strings that contain overflow-looking substrings
+  // must NOT be classified as overflow — they are retried normally.
+  const nonOverflowCases = [
+    'Throttling error: Too many tokens, please wait before trying again.',
+    'Service unavailable: temporarily offline',
+    'rate limit exceeded',
+    'Too many requests — slow down',
+  ];
+
+  nonOverflowCases.forEach((pattern) => {
+    it(`does not classify throttling/rate-limit as overflow: "${pattern}"`, () => {
+      const msg = createAssistantError(pattern);
+      expect(isContextOverflowError(msg)).toBe(false);
+    });
+  });
+
+  it('returns false for non-overflow errors', () => {
+    expect(isContextOverflowError(createAssistantError('Connection error'))).toBe(false);
+    expect(isContextOverflowError(createAssistantError('500 Internal Server Error'))).toBe(false);
+    expect(isContextOverflowError(createAssistantError('Not enough credits'))).toBe(false);
+  });
+
+  it('returns false for non-error messages', () => {
+    const msg = { role: 'assistant', stopReason: 'stop', content: [] } as unknown as AgentMessage;
+    expect(isContextOverflowError(msg)).toBe(false);
+  });
+
+  it('returns false for messages without errorMessage', () => {
+    const msg = { role: 'assistant', stopReason: 'error', content: [] } as unknown as AgentMessage;
+    expect(isContextOverflowError(msg)).toBe(false);
+  });
+
+  it('returns false for user messages', () => {
+    const msg = { role: 'user', content: [{ type: 'text', text: 'test' }] } as unknown as AgentMessage;
+    expect(isContextOverflowError(msg)).toBe(false);
   });
 });
 

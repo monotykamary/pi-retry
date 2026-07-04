@@ -397,6 +397,69 @@ describe("infinite retry loop", () => {
   });
 });
 
+// ── Context overflow defers to compaction (does NOT retry in place) ──
+
+describe("context overflow defers to compaction", () => {
+  it("does NOT call prompt([]) for an overflow error", async () => {
+    const { handlers, agent, restore } = await setup();
+    try {
+      const entries = [errorEntry("prompt is too long: 213462 tokens > 200000 maximum")];
+      fireAgentEndAsync(handlers, entries);
+
+      // Far beyond any backoff — if pi-retry retried, prompt([]) would fire.
+      await advanceThroughRetry(70000);
+
+      expect(agent.prompt).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("notifies that it is deferring to compaction", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      const entries = [errorEntry("Your input exceeds the context window of this model")];
+      const ctx = createMockCtx(entries);
+      const fns = handlers["agent_end"] ?? [];
+      for (const fn of fns) {
+        await fn({ messages: [] }, ctx);
+      }
+
+      expect(ctx.ui.notify).toHaveBeenCalled();
+      const messages = ctx.ui.notify.mock.calls.map((c: any) => c[0] as string);
+      expect(messages.some((m) => /Context overflow/i.test(m))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does NOT set the retry mutex (pi-core's compaction-continue stays unblocked)", async () => {
+    // After deferring, a subsequent retryable (non-overflow) error must still
+    // be able to drive prompt([]) — i.e. the mutex was not left held.
+    const { handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockImplementation(() => {
+        agent.state.messages = [
+          { role: "assistant", stopReason: "stop", content: [] },
+        ];
+        return Promise.resolve();
+      }),
+    });
+    try {
+      // First: overflow → defer (no prompt, mutex not held)
+      fireAgentEndAsync(handlers, [errorEntry("prompt is too long: 213462 > 200000")]);
+      await advanceThroughRetry(3000);
+      expect(agent.prompt).not.toHaveBeenCalled();
+
+      // Then: a connection error → should retry normally
+      fireAgentEndAsync(handlers, [errorEntry("Connection error")]);
+      await advanceThroughRetry(3000);
+      expect(agent.prompt).toHaveBeenCalledWith([]);
+    } finally {
+      restore();
+    }
+  });
+});
+
 // ── Bug 2: agent_end handler does not block processEvents ──
 
 describe("non-blocking agent_end handler", () => {
