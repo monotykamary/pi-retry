@@ -847,7 +847,7 @@ describe("interruptible abort and session change", () => {
     }
   });
 
-  it("finally block does not clobber _continueInProgress on generation change", async () => {
+  it("releases _continueInProgress after the owning generation exits", async () => {
     let promptCount = 0;
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
@@ -864,6 +864,7 @@ describe("interruptible abort and session change", () => {
 
       // Advance through the first prompt
       await advanceThroughRetry(3000);
+      const countBeforeSessionSwitch = promptCount;
 
       // Fire session_start — increments generation
       const sessionHandlers = handlers["session_start"] ?? [];
@@ -886,7 +887,7 @@ describe("interruptible abort and session change", () => {
       await advanceThroughRetry(3000);
 
       // A new prompt should have been called (from the new session's retry)
-      expect(agent.prompt).toHaveBeenCalled();
+      expect(promptCount).toBeGreaterThan(countBeforeSessionSwitch);
     } finally {
       restore();
     }

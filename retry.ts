@@ -168,6 +168,8 @@ let _userAborted = false;
 // automatic retry) race through waitForIdle() and both call prompt([]),
 // producing "Agent is already processing".
 let _continueInProgress = false;
+// Session generation that owns the retry mutex and its Escape handler.
+let _continueGeneration: number | null = null;
 
 // Timestamp of the last completed triggerInvisibleContinue().
 // Used by the continue() monkey-patch to avoid double continuation when
@@ -178,6 +180,8 @@ let _lastInvisibleContinueTime = 0;
 // The retry loop captures the current generation when it starts and exits
 // when it changes — this handles /new and other session switches.
 let _sessionGeneration = 0;
+
+let _terminalInputUnsubscribe: (() => void) | null = null;
 
 // Interruptible sleep: polls _userAborted and _sessionGeneration every
 // 100ms.  Returns true if interrupted (abort or session change), false if
@@ -501,7 +505,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Initialize
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     // Bump the generation counter so any in-flight retry loop from a
     // previous session exits on its next checkpoint (within 100ms during
     // backoff sleep, or immediately after prompt([]) returns).
@@ -513,11 +517,29 @@ export default function (pi: ExtensionAPI) {
     stateOther.reset();
     stateContinuation.reset();
     // Do NOT reset _continueInProgress here — the in-flight loop's
-    // finally block handles it conditionally (only if the generation
-    // hasn't changed since the loop started).  Resetting it here would
-    // break the mutex invariant and could allow a second loop to start.
+    // finally block releases its owner token. Resetting it here could allow
+    // a second loop to start before the old one has settled.
     _lastInvisibleContinueTime = 0;
     _userAborted = false;
+
+    _terminalInputUnsubscribe?.();
+    _terminalInputUnsubscribe = null;
+
+    if (ctx.mode === "tui") {
+      _terminalInputUnsubscribe = ctx.ui.onTerminalInput(data => {
+        if (
+          data !== "\x1b" ||
+          !_continueInProgress ||
+          _continueGeneration !== _sessionGeneration
+        ) {
+          return undefined;
+        }
+
+        _userAborted = true;
+        ctx.abort();
+        return { consume: true };
+      });
+    }
   });
 
   // Retry loop driver — the core of pi-retry.
@@ -548,6 +570,7 @@ export default function (pi: ExtensionAPI) {
     // Capture the current session generation. If /new fires while we're
     // looping, _sessionGeneration will increment and the loop will exit.
     const myGeneration = _sessionGeneration;
+    _continueGeneration = myGeneration;
 
     try {
       // Wait for the current run to finish (activeRun resolves in
@@ -602,11 +625,10 @@ export default function (pi: ExtensionAPI) {
         // Error again — loop back for another attempt.
       }
     } finally {
-      // Only reset the mutex if the session hasn't changed since we
-      // started.  If /new fired, a new retry loop may already own the
-      // mutex — resetting it here would clobber that.
-      if (_sessionGeneration === myGeneration) {
+      // Release the mutex only if this loop still owns it.
+      if (_continueGeneration === myGeneration) {
         _continueInProgress = false;
+        _continueGeneration = null;
       }
       _lastInvisibleContinueTime = Date.now();
     }
