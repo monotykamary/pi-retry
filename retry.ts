@@ -17,6 +17,8 @@ import {
   getErrorCategory,
   RetryState,
   ContinuationState,
+  RETRY_TRIGGER_CUSTOM_TYPE,
+  CONTINUATION_CUSTOM_TYPE,
 } from "./src/index.js";
 
 /**
@@ -33,29 +35,22 @@ import {
  * - Automatic detection and retry for ALL errors (catch-all)
  * - Indefinite retry with exponential backoff (capped at 60s)
  * - Auto-continuation when model hits max output tokens (stopReason "length")
- * - ALL triggers are invisible — agent.prompt([]) resumes the loop with no new message
+ * - ALL triggers are invisible — hidden AgentSession turns are filtered before the LLM call
  * - Unified manual controls via /retry command
  *
- * Invisibility mechanism:
- *   - Agent.prototype.subscribe monkey-patch captures the Agent instance
- *   - agent.prompt([]) starts a fresh agent loop with an empty prompt array
- *   - No message injected into context — LLM sees the exact same message list
- *   - No convertToLlm involvement, no filter needed, no session artifact
+ * Continuation mechanism:
+ *   - A hidden custom message starts or joins a canonical AgentSession turn
+ *   - A context hook removes that marker before provider serialization
+ *   - AgentSession remains authoritative for busy state and queued messages
  *
  * Retry loop design:
  *   - The agent_end handler detects retryable errors but does NOT sleep.
  *     It fires triggerInvisibleContinue() immediately, keeping processEvents
  *     unblocked so the agent can finish its run and become idle.
  *   - triggerInvisibleContinue() owns the retry loop: it waits for idle,
- *     removes error assistant messages from agent state, calls prompt([])
- *     and checks the result. On error it sleeps (outside processEvents)
- *     and retries. On success or user abort the loop exits.
- *   - The continue() monkey-patch cooperates: while _continueInProgress is
- *     true, the session's continue() spins. After the loop finishes, it
- *     calls _origContinue which checks the now-updated agent state. For
- *     stopReason "error" it no longer falls back to prompt([]) (the loop
- *     already handled it). For toolUse/length (compaction mid-task) it
- *     still falls back to prompt([]).
+ *     removes error assistant messages from live state, queues a hidden
+ *     AgentSession turn, and checks the result. On error it sleeps outside
+ *     processEvents and retries. On success or user abort the loop exits.
  */
 
 // Capture the live Agent instance when AgentSession subscribes to it.
@@ -68,64 +63,6 @@ const _origSubscribe = Agent.prototype.subscribe as (...args: any[]) => any;
 Agent.prototype.subscribe = function (this: Agent, ...args: any[]) {
   _agent = this;
   return _origSubscribe.apply(this, args);
-};
-
-// Monkey-patch continue() so the session's built-in retry loop cooperates
-// with our _continueInProgress mutex AND can convert the "Cannot continue
-// from assistant" error into a prompt([]) call when the agent was mid-task
-// (compaction, toolUse, length — but NOT error, which the loop handles).
-//
-// Note (pi 0.79+): Agent.continue() now drains queued steering/follow-up
-// messages before throwing, so this throw path only fires when there are
-// genuinely no queued messages — the prompt([]) fallback is still correct.
-const _origContinue = Agent.prototype.continue as (this: Agent) => Promise<void>;
-Agent.prototype.continue = function (this: Agent) {
-  const self = this;
-  return (async () => {
-    // Wait while pi-retry is driving the agent so we don't double-dip.
-    while (_continueInProgress) {
-      await new Promise(r => setTimeout(r, 10));
-    }
-    try {
-      return await _origContinue.call(self);
-    } catch (e: any) {
-      const msg = e?.message ?? '';
-      if (msg.includes('Cannot continue from message role') ||
-          msg.includes('Cannot continue from an assistant message')) {
-        const lastMsg = self.state.messages[self.state.messages.length - 1];
-        if (lastMsg?.role === 'assistant') {
-          // stopReason "error": pi-retry's loop is the error handler.
-          // It will have already retried or the user aborted — don't
-          // start a second retry path via prompt([]).
-          if (lastMsg.stopReason === 'error') {
-            return;
-          }
-          // stopReason "stop" / "aborted": agent finished or user cancelled.
-          // Don't continue.
-          if (lastMsg.stopReason === 'stop' || lastMsg.stopReason === 'aborted') {
-            return;
-          }
-          // stopReason "toolUse" or "length": agent was mid-task (e.g.
-          // compaction broke the message ordering). Fall back to prompt([]).
-          if (!_continueInProgress) {
-            _continueInProgress = true;
-            try {
-              await self.prompt([]);
-            } catch {
-              // Agent already processing or other transient error
-            } finally {
-              _continueInProgress = false;
-            }
-          }
-        }
-        return;
-      }
-      if (msg.includes('Agent is already processing')) {
-        return;
-      }
-      throw e;
-    }
-  })();
 };
 
 // Monkey-patch AgentSession._prepareRetry to suppress the built-in retry
@@ -143,7 +80,10 @@ Agent.prototype.continue = function (this: Agent) {
 // built-in retry works normally as a fallback.
 const _origPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 (AgentSession.prototype as any)._prepareRetry = function(this: any, message: any) {
-  if (_continueInProgress) {
+  if (
+    _continueInProgress &&
+    _continueInputGeneration === _inputGeneration
+  ) {
     return Promise.resolve(false);
   }
   return _origPrepareRetry.call(this, message);
@@ -160,21 +100,17 @@ const stateContinuation = new ContinuationState();
 
 // Abort flag: set when turn_end reports stopReason "aborted", cleared on
 // session_start and on fresh user activity.  Prevents triggerInvisibleContinue()
-// from driving a new prompt([]) after the user explicitly cancelled.
+// from starting a hidden retry turn after the user explicitly cancelled.
 let _userAborted = false;
 
 // Mutex: only one triggerInvisibleContinue may be in-flight at a time.
 // Without this, concurrent agent_end events (or a manual /retry during an
-// automatic retry) race through waitForIdle() and both call prompt([]),
-// producing "Agent is already processing".
+// automatic retry) could queue duplicate turns for the same failure.
 let _continueInProgress = false;
 // Session generation that owns the retry mutex and its Escape handler.
 let _continueGeneration: number | null = null;
-
-// Timestamp of the last completed triggerInvisibleContinue().
-// Used by the continue() monkey-patch to avoid double continuation when
-// triggerInvisibleContinue just ran and the session's continue() unblocks.
-let _lastInvisibleContinueTime = 0;
+let _continueInputGeneration: number | null = null;
+let _inputGeneration = 0;
 
 // Session generation counter: incremented on every session_start.
 // The retry loop captures the current generation when it starts and exits
@@ -186,14 +122,22 @@ let _terminalInputUnsubscribe: (() => void) | null = null;
 // Interruptible sleep: polls _userAborted and _sessionGeneration every
 // 100ms.  Returns true if interrupted (abort or session change), false if
 // the full delay elapsed normally.
-function interruptibleSleep(ms: number, generation: number): Promise<boolean> {
+function interruptibleSleep(
+  ms: number,
+  generation: number,
+  inputGeneration: number,
+): Promise<boolean> {
   if (ms <= 0) return Promise.resolve(false);
   return new Promise(resolve => {
     const checkInterval = 100;
     let elapsed = 0;
     const timer = setInterval(() => {
       elapsed += checkInterval;
-      if (_userAborted || _sessionGeneration !== generation) {
+      if (
+        _userAborted ||
+        _sessionGeneration !== generation ||
+        _inputGeneration !== inputGeneration
+      ) {
         clearInterval(timer);
         resolve(true);
       } else if (elapsed >= ms) {
@@ -227,6 +171,25 @@ function lastMessageIsRetryableError(): boolean {
 
 export default function (pi: ExtensionAPI) {
 
+  const markRealPromptStart = () => {
+    _inputGeneration++;
+  };
+  pi.on("input", (event) => {
+    if (event.source === "interactive" || event.source === "rpc") {
+      markRealPromptStart();
+    }
+  });
+  pi.on("before_agent_start", markRealPromptStart);
+
+  pi.on("context", (event) => {
+    const messages = event.messages.filter((message: any) => !(
+      message.role === "custom" &&
+      (message.customType === RETRY_TRIGGER_CUSTOM_TYPE ||
+        message.customType === CONTINUATION_CUSTOM_TYPE)
+    ));
+    if (messages.length !== event.messages.length) return { messages };
+  });
+
   // Reset retry counters on successful completion (not max_tokens, not error)
   pi.on("turn_end", async (event, ctx) => {
     const msg = event.message as any;
@@ -240,7 +203,7 @@ export default function (pi: ExtensionAPI) {
         stateOther.reset();
         stateContinuation.endContinuation();
         // Signal to any in-flight triggerInvisibleContinue or pending retry
-        // that the user has cancelled — don't drive a new prompt([]).
+        // that the user has cancelled — do not queue another retry turn.
         _userAborted = true;
         return;
       }
@@ -276,12 +239,15 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Guard: if the user aborted, don't drive any new prompt([])
+    // Guard: if the user aborted, do not queue another retry turn.
     if (_userAborted) return;
 
     // If the retry loop is already driving, don't interfere — it will
     // see the new error on its next loop iteration.
-    if (_continueInProgress) return;
+    if (
+      _continueInProgress &&
+      _continueInputGeneration === _inputGeneration
+    ) return;
 
     // Check for max_tokens stop — auto-continue (invisible to LLM)
     if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
@@ -297,20 +263,9 @@ export default function (pi: ExtensionAPI) {
 
     // Context overflow: defer to compaction. Do NOT retry here.
     //
-    // triggerInvisibleContinue() calls agent.prompt([]) directly on the core
-    // Agent, bypassing AgentSession._handlePostAgentRun → _checkCompaction, so
-    // a pi-retry retry loop gets NO compaction. Retrying an overflow would
-    // re-send the same oversized context → overflow again → infinite loop
-    // (pi-retry's error loop is uncapped). Meanwhile pi-retry's _continueInProgress
-    // mutex would block pi-core's own compaction-retry (agent.continue()), so
-    // pi-core never gets to compact either.
-    //
-    // Instead, return without firing triggerInvisibleContinue. pi-core's
-    // _checkCompaction (which runs in _handlePostAgentRun regardless of
-    // extensions) detects the same overflow, compacts (statically via pi-vcc
-    // when installed), and retries once via agent.continue() with the reduced
-    // context. _continueInProgress stays false, so pi-core's continue is
-    // unblocked.
+    // Retrying the same oversized context before compaction would produce an
+    // uncapped overflow loop. Leave _continueInProgress false so Pi can run
+    // its normal compaction and retry path with the reduced context.
     if (isContextOverflowError(lastAssistant)) {
       ctx.ui.notify(
         "Context overflow — deferring to compaction (auto-retry after compact).",
@@ -403,7 +358,7 @@ export default function (pi: ExtensionAPI) {
         status += "Max Tokens Continuation:\n";
         status += `  Continuations used: ${stateContinuation.getCount()}\n`;
         status += `  Is continuing: ${stateContinuation.getIsContinuing()}\n`;
-        status += `  Trigger: invisible (agent.prompt([]), LLM never sees a prompt)\n\n`;
+        status += `  Trigger: hidden AgentSession turn (filtered before provider call)\n\n`;
 
         // Config
         status += "Configuration:\n";
@@ -508,7 +463,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Bump the generation counter so any in-flight retry loop from a
     // previous session exits on its next checkpoint (within 100ms during
-    // backoff sleep, or immediately after prompt([]) returns).
+    // backoff sleep, or immediately after a hidden retry turn settles).
     _sessionGeneration++;
 
     state400.reset();
@@ -519,7 +474,6 @@ export default function (pi: ExtensionAPI) {
     // Do NOT reset _continueInProgress here — the in-flight loop's
     // finally block releases its owner token. Resetting it here could allow
     // a second loop to start before the old one has settled.
-    _lastInvisibleContinueTime = 0;
     _userAborted = false;
 
     _terminalInputUnsubscribe?.();
@@ -545,12 +499,12 @@ export default function (pi: ExtensionAPI) {
   // Retry loop driver — the core of pi-retry.
   //
   // Unlike the original one-shot design, this function loops. After each
-  // prompt([]) call it checks the result:
+  // hidden AgentSession turn it checks the result:
   //   - Success (stopReason !== "error"): loop exits, agent is done.
   //   - Error (stopReason === "error"): sleep with backoff, then retry.
   //   - User abort (stopReason "aborted"): loop exits immediately.
   //
-  // The backoff sleep happens AFTER prompt([]) returns and processEvents
+  // The backoff sleep happens AFTER the hidden turn settles and processEvents
   // has settled, so it does NOT block the agent. The agent is idle during
   // the sleep and can respond to user input (e.g. Escape to abort).
   //
@@ -560,7 +514,7 @@ export default function (pi: ExtensionAPI) {
   async function triggerInvisibleContinue() {
     if (!_agent) return;
 
-    // Guard: if the user aborted, don't drive a new prompt([]).
+    // Guard: if the user aborted, do not queue another retry turn.
     if (_userAborted) return;
 
     // Guard: mutex — if a previous continue is still in-flight, skip
@@ -570,7 +524,9 @@ export default function (pi: ExtensionAPI) {
     // Capture the current session generation. If /new fires while we're
     // looping, _sessionGeneration will increment and the loop will exit.
     const myGeneration = _sessionGeneration;
+    const myInputGeneration = _inputGeneration;
     _continueGeneration = myGeneration;
+    _continueInputGeneration = myInputGeneration;
 
     try {
       // Wait for the current run to finish (activeRun resolves in
@@ -579,16 +535,25 @@ export default function (pi: ExtensionAPI) {
 
       // Re-check after waitForIdle: the user may have aborted or the
       // session may have changed while we were waiting.
-      if (_userAborted || _sessionGeneration !== myGeneration) return;
+      if (
+        _userAborted ||
+        _sessionGeneration !== myGeneration ||
+        _inputGeneration !== myInputGeneration
+      ) return;
 
       let attempt = 0;
 
       // Loop until success, abort, or session change.
       while (true) {
-        if (_userAborted || _sessionGeneration !== myGeneration) return;
+        if (
+          _userAborted ||
+          _sessionGeneration !== myGeneration ||
+          _inputGeneration !== myInputGeneration
+        ) return;
 
-        // Remove the error assistant message from agent state so
-        // prompt([]) sends a clean context to the LLM.
+        // Preserve the trigger kind before removing a trailing error from
+        // live state. The error remains in the session journal for history.
+        const isErrorRetry = lastMessageIsRetryableError();
         removeErrorFromAgentState();
 
         attempt++;
@@ -601,22 +566,44 @@ export default function (pi: ExtensionAPI) {
         // Polls _userAborted and _sessionGeneration every 100ms so ESC
         // and /new take effect within 100ms instead of waiting for the
         // full backoff (up to 60s).
-        const interrupted = await interruptibleSleep(delay, myGeneration);
-        if (interrupted) return;
+        const interrupted = await interruptibleSleep(
+          delay,
+          myGeneration,
+          myInputGeneration,
+        );
+        if (interrupted || _inputGeneration !== myInputGeneration) return;
 
         try {
-          await _agent.prompt([]);
+          pi.sendMessage(
+            {
+              customType: isErrorRetry
+                ? RETRY_TRIGGER_CUSTOM_TYPE
+                : CONTINUATION_CUSTOM_TYPE,
+              content: [],
+              display: false,
+              details: undefined,
+            },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+
+          // sendMessage is fire-and-forget, but AgentSession publishes the
+          // low-level run synchronously before returning. Waiting on Agent
+          // keeps this retry loop intact without bypassing session state.
+          await Promise.resolve();
+          await _agent.waitForIdle();
         } catch {
-          // "Agent is already processing" or other transient error —
-          // the session or another driver is handling it.
           return;
         }
 
         // Re-check after prompt: the user may have hit ESC during the
         // prompt, or /new may have fired — don't keep retrying.
-        if (_userAborted || _sessionGeneration !== myGeneration) return;
+        if (
+          _userAborted ||
+          _sessionGeneration !== myGeneration ||
+          _inputGeneration !== myInputGeneration
+        ) return;
 
-        // prompt([]) completed. Check the result.
+        // The hidden AgentSession turn completed. Check the result.
         if (!lastMessageIsRetryableError()) {
           // Success or non-error terminal state — exit the loop.
           return;
@@ -629,8 +616,8 @@ export default function (pi: ExtensionAPI) {
       if (_continueGeneration === myGeneration) {
         _continueInProgress = false;
         _continueGeneration = null;
+        _continueInputGeneration = null;
       }
-      _lastInvisibleContinueTime = Date.now();
     }
   }
 

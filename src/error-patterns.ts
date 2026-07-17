@@ -9,6 +9,9 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
+export const RETRY_TRIGGER_CUSTOM_TYPE = "pi-retry:retry";
+export const CONTINUATION_CUSTOM_TYPE = "pi-retry:continue";
+
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
 const ERROR_400_413_PATTERNS = [
@@ -69,8 +72,8 @@ const BUILTIN_HANDLED_PATTERNS = [
 // compaction exactly when pi-core's _checkCompaction will detect overflow and
 // compact + retry. kept in sync manually — pi-ai is not a direct dependency.
 //
-// Why these are NOT retried by pi-retry: retrying an overflow via prompt([])
-// re-sends the same oversized context, so it overflows again → infinite loop
+// Why these are NOT retried by pi-retry: a hidden retry turn would re-send
+// the same oversized context, so it overflows again → infinite loop
 // (pi-retry's loop is uncapped for errors). pi-core instead compacts and
 // retries once via agent.continue(); with static compaction (pi-vcc) that
 // reliably reduces context, so the single retry succeeds.

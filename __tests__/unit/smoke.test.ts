@@ -9,8 +9,8 @@
  * - Non-retryable errors are not retried
  * - Built-in retry is suppressed when pi-retry loop is active
  *
- * Note: the retry loop sleeps BEFORE each prompt([]) call (backoff).
- * So the timeline for N retries is: 2s + 4s + 8s + ... + 2^N s.
+ * The retry loop sleeps before each hidden AgentSession turn. The timeline
+ * for N retries is 2s + 4s + 8s + ... with a 60s cap.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -23,6 +23,8 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
+
+let activeMockAgent: { prompt(input: unknown[]): Promise<void> } | undefined;
 
 // ── Helpers ──
 
@@ -37,6 +39,9 @@ function createMockAPI() {
     registerCommand(name: string, opts: { handler: (args: string[], ctx: any) => Promise<void> }) {
       commands[name] = opts;
     },
+    sendMessage: vi.fn(() => {
+      void activeMockAgent?.prompt([]).catch(() => {});
+    }),
   } as unknown as ExtensionAPI;
 
   return { api, handlers, commands };
@@ -76,6 +81,7 @@ async function setup() {
     restore: () => {
       Agent.prototype.subscribe = origSubscribe;
       Agent.prototype.continue = origContinue;
+      activeMockAgent = undefined;
     },
   };
 }
@@ -95,6 +101,7 @@ async function createAgentWithMessages(messages: any[], promptFn?: () => Promise
       return () => this.listeners.delete(listener);
     },
   };
+  activeMockAgent = agent;
   Agent.prototype.subscribe.call(agent, vi.fn());
   return agent;
 }
@@ -306,7 +313,7 @@ describe("litmus: bug fix verification", () => {
   });
 
   // Bug 3: Error message not removed → LLM gets corrupted context
-  it("error assistant message is removed before prompt([])", async () => {
+  it("error assistant message is removed before the hidden turn", async () => {
     const { handlers, restore } = await setup();
     try {
       const capturedMessages: any[][] = [];

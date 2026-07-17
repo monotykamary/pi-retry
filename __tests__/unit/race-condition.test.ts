@@ -1,24 +1,10 @@
 /**
- * Integration tests for the triggerInvisibleContinue retry loop.
+ * Integration tests for the hidden AgentSession retry loop.
  *
- * The retry loop in triggerInvisibleContinue:
- *   1. Waits for idle (waitForIdle)
- *   2. Removes error assistant messages from agent state
- *   3. Loops: notify → sleep(backoff) → prompt([]) → check result
- *   4. On error: loops back to step 3
- *   5. On success or user abort: exits the loop
- *
- * Defense layers:
- *   1. _continueInProgress mutex — prevents concurrent calls from racing
- *   2. continue() monkey-patch — session's continue() waits while our
- *      retry is in-flight, then gracefully no-ops.  For stopReason "error"
- *      it no longer falls back to prompt([]) (the loop handles it).
- *   3. await prompt([]) + try/catch — holds the mutex for the full retry
- *      so the session stays alive.
- *
- * The agent_end handler does NOT sleep — it returns immediately and
- * kicks off triggerInvisibleContinue. Backoff sleeps happen inside the
- * loop, before each prompt([]) call (outside processEvents).
+ * The production extension requests each attempt with pi.sendMessage() and a
+ * filtered custom marker. The test API models AgentSession by delegating that
+ * request to a controllable fake Agent, which lets these tests exercise
+ * backoff, state cleanup, cancellation, and eventual success deterministically.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -33,6 +19,8 @@ afterEach(() => {
 });
 
 // ── Helpers ──
+
+let activeMockAgent: MockAgentInstance | undefined;
 
 interface MockAgentInstance {
   listeners: Set<Function>;
@@ -71,6 +59,9 @@ function createMockAgent(overrides?: {
 function createMockAPI() {
   const handlers: Record<string, Function[]> = {};
   const commands: Record<string, { handler: (args: string[], ctx: any) => Promise<void> }> = {};
+  const sendMessage = vi.fn(() => {
+    void activeMockAgent?.prompt([]).catch(() => {});
+  });
 
   const api = {
     on(event: string, handler: Function) {
@@ -79,9 +70,10 @@ function createMockAPI() {
     registerCommand(name: string, opts: { handler: (args: string[], ctx: any) => Promise<void> }) {
       commands[name] = opts;
     },
+    sendMessage,
   } as unknown as ExtensionAPI;
 
-  return { api, handlers, commands };
+  return { api, handlers, commands, sendMessage };
 }
 
 function createMockCtx(entries: unknown[] = []) {
@@ -124,28 +116,55 @@ async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
   const mod = await import("../../retry.ts");
   const factory = mod.default;
 
-  const { api, handlers, commands } = createMockAPI();
+  const { api, handlers, commands, sendMessage } = createMockAPI();
   factory(api);
 
   const agent = createMockAgent(agentOverrides);
+  activeMockAgent = agent;
   Agent.prototype.subscribe.call(agent, vi.fn());
 
   return {
     handlers,
     commands,
     agent,
+    sendMessage,
+    origContinue,
     restore: () => {
       Agent.prototype.subscribe = origSubscribe;
       Agent.prototype.continue = origContinue;
+      activeMockAgent = undefined;
     },
   };
 }
 
 // ── Tests ──
 
+describe("hidden retry context", () => {
+  it("filters retry and continuation markers before provider conversion", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      const user = { role: "user", content: [{ type: "text", text: "work" }] };
+      const messages = [
+        user,
+        { role: "custom", customType: "pi-retry:retry", content: [] },
+        { role: "custom", customType: "pi-retry:continue", content: [] },
+      ];
+
+      const result = await handlers.context[0]({ messages }, createMockCtx());
+      expect(result).toEqual({ messages: [user] });
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("triggerInvisibleContinue retry loop", () => {
-  it("Guard 1 (mutex): concurrent agent_end events only trigger one prompt()", async () => {
-    const { handlers, agent, restore } = await setup();
+  it("mutex: concurrent agent_end events request one hidden turn", async () => {
+    const { handlers, agent, sendMessage, restore } = await setup({
+      messages: [
+        { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+      ],
+    });
     try {
       const entries = [errorEntry("Connection error")];
 
@@ -157,31 +176,31 @@ describe("triggerInvisibleContinue retry loop", () => {
 
       expect(agent.prompt).toHaveBeenCalledTimes(1);
       expect(agent.prompt).toHaveBeenCalledWith([]);
+      expect(sendMessage).toHaveBeenCalledWith(
+        {
+          customType: "pi-retry:retry",
+          content: [],
+          display: false,
+          details: undefined,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
     } finally {
       restore();
     }
   });
 
-  it("Guard 2 (continue monkey-patch): is installed and functional", async () => {
-    const { restore } = await setup();
+  it("does not monkey-patch Agent.continue", async () => {
+    const { origContinue, restore } = await setup();
     try {
       const { Agent } = await import("@earendil-works/pi-agent-core");
-
-      expect(Agent.prototype.continue).toBeDefined();
-      expect(typeof Agent.prototype.continue).toBe("function");
-
-      const result = Agent.prototype.continue.call({
-        state: { messages: [], isStreaming: false },
-        waitForIdle: vi.fn().mockResolvedValue(undefined),
-      });
-      expect(result).toBeInstanceOf(Promise);
-      result.catch(() => {});
+      expect(Agent.prototype.continue).toBe(origContinue);
     } finally {
       restore();
     }
   });
 
-  it("try/catch around await prompt() swallows rejections", async () => {
+  it("transport safely contains a rejected fake run", async () => {
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() =>
         Promise.reject(new Error("Agent is already processing a prompt")),
@@ -305,7 +324,7 @@ describe("triggerInvisibleContinue retry loop", () => {
 // ── Bug 1: Retry loop is not one-shot ──
 
 describe("infinite retry loop", () => {
-  it("retries multiple times in a row when prompt([]) keeps failing", async () => {
+  it("retries multiple hidden turns while attempts keep failing", async () => {
     let promptCount = 0;
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
@@ -330,7 +349,7 @@ describe("infinite retry loop", () => {
     }
   });
 
-  it("exits the loop when prompt([]) succeeds", async () => {
+  it("exits the loop when a hidden turn succeeds", async () => {
     let promptCount = 0;
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
@@ -400,13 +419,13 @@ describe("infinite retry loop", () => {
 // ── Context overflow defers to compaction (does NOT retry in place) ──
 
 describe("context overflow defers to compaction", () => {
-  it("does NOT call prompt([]) for an overflow error", async () => {
+  it("does not request a hidden turn for an overflow error", async () => {
     const { handlers, agent, restore } = await setup();
     try {
       const entries = [errorEntry("prompt is too long: 213462 tokens > 200000 maximum")];
       fireAgentEndAsync(handlers, entries);
 
-      // Far beyond any backoff — if pi-retry retried, prompt([]) would fire.
+      // Far beyond any backoff — a retry request would have fired by now.
       await advanceThroughRetry(70000);
 
       expect(agent.prompt).not.toHaveBeenCalled();
@@ -435,7 +454,7 @@ describe("context overflow defers to compaction", () => {
 
   it("does NOT set the retry mutex (pi-core's compaction-continue stays unblocked)", async () => {
     // After deferring, a subsequent retryable (non-overflow) error must still
-    // be able to drive prompt([]) — i.e. the mutex was not left held.
+    // be able to request a hidden turn, so the mutex was not left held.
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
         agent.state.messages = [
@@ -492,7 +511,7 @@ describe("non-blocking agent_end handler", () => {
 // ── Bug 3: Error message removal before retry ──
 
 describe("error message removal from agent state", () => {
-  it("removes error assistant message before calling prompt([])", async () => {
+  it("removes the error assistant message before requesting the hidden turn", async () => {
     const promptCalls: any[][] = [];
 
     const { handlers, agent, restore } = await setup({
@@ -562,41 +581,10 @@ describe("error message removal from agent state", () => {
   });
 });
 
-// ── Bug 4: continue() monkey-patch does not create second retry path for errors ──
+// Built-in retry coordination.
 
-describe("continue monkey-patch stopReason routing", () => {
-  const routingTable = [
-    { stopReason: "error", shouldPrompt: false, reason: "loop handles errors" },
-    { stopReason: "stop", shouldPrompt: false, reason: "agent finished cleanly" },
-    { stopReason: "aborted", shouldPrompt: false, reason: "user cancelled" },
-    { stopReason: "toolUse", shouldPrompt: true, reason: "compaction mid-task" },
-    { stopReason: "length", shouldPrompt: true, reason: "compaction mid-task" },
-  ];
-
-  it("exhaustive routing table matches source", async () => {
-    const fs = await import("fs");
-    const path = await import("path");
-    const source = fs.readFileSync(
-      path.resolve(__dirname, "../../retry.ts"),
-      "utf-8"
-    );
-
-    for (const { stopReason, shouldPrompt } of routingTable) {
-      if (!shouldPrompt) {
-        expect(source).toContain(`lastMsg.stopReason === '${stopReason}'`);
-      }
-    }
-
-    expect(source).toMatch(/stopReason === 'error'/);
-    expect(source).toMatch(/stopReason === 'stop' \|\| lastMsg\.stopReason === 'aborted'/);
-
-    // Verify _prepareRetry monkey-patch is present
-    expect(source).toContain('_origPrepareRetry');
-    expect(source).toContain('_continueInProgress');
-    expect(source).toContain('Promise.resolve(false)');
-  });
-
-  it("loop retried error → monkey-patch does not double-retry", async () => {
+describe("built-in retry coordination", () => {
+  it("the hidden-turn loop does not double-retry an error", async () => {
     let promptCount = 0;
     const { handlers, agent, restore } = await setup({
       prompt: vi.fn().mockImplementation(() => {
@@ -699,6 +687,25 @@ describe("RetryState tracking in retry loop", () => {
 
 // ── Bug: ESC abort not responsive / /new continues retrying ──
 
+describe("real prompt startup wins over retry backoff", () => {
+  it("cancels the pending hidden turn before a user prompt enters AgentSession", async () => {
+    const { handlers, agent, restore } = await setup();
+    try {
+      fireAgentEndAsync(handlers, [errorEntry("Connection error")]);
+      await advanceThroughRetry(500);
+
+      for (const handler of handlers.input ?? []) {
+        await handler({ source: "interactive", text: "user work" }, createMockCtx());
+      }
+      await advanceThroughRetry(5000);
+
+      expect(agent.prompt).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("interruptible abort and session change", () => {
   it("ESC aborts during backoff sleep within 100ms", async () => {
     let promptCount = 0;
@@ -737,7 +744,7 @@ describe("interruptible abort and session change", () => {
     }
   });
 
-  it("ESC abort detected after prompt([]) returns", async () => {
+  it("Escape abort is detected after the hidden turn returns", async () => {
     let promptCount = 0;
     let resolvePrompt!: () => void;
     const { handlers, agent, restore } = await setup({

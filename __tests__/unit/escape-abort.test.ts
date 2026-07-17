@@ -32,20 +32,25 @@ async function setup() {
   const originalPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
   const handlers: Record<string, Function[]> = {};
+  let agent: any;
   const api = {
     on(event: string, handler: Function) {
       (handlers[event] ??= []).push(handler);
     },
     registerCommand() {},
+    sendMessage() {
+      void agent?.prompt([]).catch(() => {});
+    },
   } as unknown as ExtensionAPI;
 
   const { default: retryExtension } = await import("../../retry.ts");
   retryExtension(api);
 
   let resolvePrompt: (() => void) | undefined;
-  const agent: any = {
+  let activePrompt: Promise<void> = Promise.resolve();
+  agent = {
     listeners: new Set<Function>(),
-    waitForIdle: vi.fn().mockResolvedValue(undefined),
+    waitForIdle: vi.fn(() => activePrompt),
     prompt: vi.fn(),
     state: {
       isStreaming: false,
@@ -66,12 +71,13 @@ async function setup() {
 
   agent.prompt.mockImplementation(() => {
     agent.state.isStreaming = true;
-    return new Promise<void>(resolve => {
+    activePrompt = new Promise<void>(resolve => {
       resolvePrompt = () => {
         agent.state.isStreaming = false;
         resolve();
       };
     });
+    return activePrompt;
   });
 
   Agent.prototype.subscribe.call(agent, vi.fn());
