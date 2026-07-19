@@ -138,6 +138,7 @@ const BACKOFF_MULTIPLIER = 2;      // Double each time
 5. **Retry or continue (both invisible)** — Wait (exponential backoff for errors), then trigger a new turn via `pi.sendMessage()` with `customType`, `display: false`, and `triggerTurn: true`
 6. **Context cleanup** — The `context` event strips all custom-type triggers before the LLM sees them (insurance against custom `convertToLlm` overrides)
 7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; each continuation produces valid output and the model naturally terminates when done
+8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
 

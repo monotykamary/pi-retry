@@ -64,6 +64,7 @@ function createMockAPI() {
   });
 
   const api = {
+      events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
     on(event: string, handler: Function) {
       (handlers[event] ??= []).push(handler);
     },

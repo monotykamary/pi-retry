@@ -34,6 +34,7 @@ async function setup() {
   const handlers: Record<string, Function[]> = {};
   let agent: any;
   const api = {
+      events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
     on(event: string, handler: Function) {
       (handlers[event] ??= []).push(handler);
     },

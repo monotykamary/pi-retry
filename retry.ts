@@ -21,6 +21,10 @@ import {
   CONTINUATION_CUSTOM_TYPE,
 } from "./src/index.js";
 
+const RETRY_STARTED_EVENT = "pi-retry:started";
+const RETRY_COMPLETED_EVENT = "pi-retry:completed";
+const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
+
 /**
  * Unified retry extension — retries EVERY error by default.
  *
@@ -111,6 +115,7 @@ let _continueInProgress = false;
 let _continueGeneration: number | null = null;
 let _continueInputGeneration: number | null = null;
 let _inputGeneration = 0;
+let _retryLifecycleId = 0;
 
 // Session generation counter: incremented on every session_start.
 // The retry loop captures the current generation when it starts and exits
@@ -520,6 +525,9 @@ export default function (pi: ExtensionAPI) {
     // Guard: mutex — if a previous continue is still in-flight, skip
     if (_continueInProgress) return;
     _continueInProgress = true;
+    const retryLifecycleId = ++_retryLifecycleId;
+    let didRetryComplete = false;
+    pi.events.emit(RETRY_STARTED_EVENT, { retryId: retryLifecycleId });
 
     // Capture the current session generation. If /new fires while we're
     // looping, _sessionGeneration will increment and the loop will exit.
@@ -606,6 +614,7 @@ export default function (pi: ExtensionAPI) {
         // The hidden AgentSession turn completed. Check the result.
         if (!lastMessageIsRetryableError()) {
           // Success or non-error terminal state — exit the loop.
+          didRetryComplete = true;
           return;
         }
 
@@ -614,6 +623,9 @@ export default function (pi: ExtensionAPI) {
     } finally {
       // Release the mutex only if this loop still owns it.
       if (_continueGeneration === myGeneration) {
+        pi.events.emit(didRetryComplete ? RETRY_COMPLETED_EVENT : RETRY_CANCELLED_EVENT, {
+          retryId: retryLifecycleId,
+        });
         _continueInProgress = false;
         _continueGeneration = null;
         _continueInputGeneration = null;

@@ -33,6 +33,7 @@ function createMockAPI() {
   const commands: Record<string, { handler: (args: string[], ctx: any) => Promise<void> }> = {};
 
   const api = {
+      events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
     on(event: string, handler: Function) {
       (handlers[event] ??= []).push(handler);
     },
@@ -75,6 +76,7 @@ async function setup() {
   factory(api);
 
   return {
+    api,
     handlers,
     commands,
     Agent,
@@ -113,6 +115,34 @@ async function advance(ms: number) {
 // ── Smoke tests ──
 
 describe("smoke: full retry lifecycle", () => {
+  it("exposes retry lifecycle events through the shared event bus", async () => {
+    const { api, handlers, restore } = await setup();
+    try {
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          ];
+          return Promise.resolve();
+        }),
+      );
+      const ctx = createMockCtx([errorEntry("Connection error")]);
+
+      for (const handler of handlers["agent_end"] ?? []) {
+        void handler({ messages: [] }, ctx);
+      }
+
+      expect(api.events.emit).toHaveBeenCalledWith("pi-retry:started", { retryId: 1 });
+
+      await advance(5_000);
+
+      expect(api.events.emit).toHaveBeenCalledWith("pi-retry:completed", { retryId: 1 });
+    } finally {
+      restore();
+    }
+  });
+
   it("connection error → 5 retries → success", async () => {
     const { handlers, restore } = await setup();
     try {
