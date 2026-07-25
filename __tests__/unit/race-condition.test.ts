@@ -2,7 +2,7 @@
  * Integration tests for the hidden AgentSession retry loop.
  *
  * The production extension requests each attempt with pi.sendMessage() and a
- * filtered custom marker. The test API models AgentSession by delegating that
+ * hidden provider-valid message. The test API models AgentSession by delegating that
  * request to a controllable fake Agent, which lets these tests exercise
  * backoff, state cleanup, cancellation, and eventual success deterministically.
  */
@@ -60,6 +60,9 @@ function createMockAPI() {
   const handlers: Record<string, Function[]> = {};
   const commands: Record<string, { handler: (args: string[], ctx: any) => Promise<void> }> = {};
   const sendMessage = vi.fn(() => {
+    for (const handler of handlers["before_agent_start"] ?? []) {
+      void handler({ prompt: "" }, {});
+    }
     void activeMockAgent?.prompt([]).catch(() => {});
   });
 
@@ -140,25 +143,6 @@ async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
 
 // ── Tests ──
 
-describe("hidden retry context", () => {
-  it("filters retry and continuation markers before provider conversion", async () => {
-    const { handlers, restore } = await setup();
-    try {
-      const user = { role: "user", content: [{ type: "text", text: "work" }] };
-      const messages = [
-        user,
-        { role: "custom", customType: "pi-retry:retry", content: [] },
-        { role: "custom", customType: "pi-retry:continue", content: [] },
-      ];
-
-      const result = await handlers.context[0]({ messages }, createMockCtx());
-      expect(result).toEqual({ messages: [user] });
-    } finally {
-      restore();
-    }
-  });
-});
-
 describe("triggerInvisibleContinue retry loop", () => {
   it("mutex: concurrent agent_end events request one hidden turn", async () => {
     const { handlers, agent, sendMessage, restore } = await setup({
@@ -180,7 +164,7 @@ describe("triggerInvisibleContinue retry loop", () => {
       expect(sendMessage).toHaveBeenCalledWith(
         {
           customType: "pi-retry:retry",
-          content: [],
+          content: "Retry the previous request.",
           display: false,
           details: undefined,
         },

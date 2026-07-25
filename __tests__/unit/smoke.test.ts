@@ -41,6 +41,9 @@ function createMockAPI() {
       commands[name] = opts;
     },
     sendMessage: vi.fn(() => {
+      for (const handler of handlers["before_agent_start"] ?? []) {
+        void handler({ prompt: "" }, {});
+      }
       void activeMockAgent?.prompt([]).catch(() => {});
     }),
   } as unknown as ExtensionAPI;
@@ -511,7 +514,12 @@ describe("smoke: max_tokens continuation", () => {
     try {
       const agent = await createAgentWithMessages(
         [{ role: "assistant", stopReason: "length", content: [{ type: "text", text: "long output..." }] }],
-        vi.fn().mockResolvedValue(undefined)
+        vi.fn().mockImplementation(() => {
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          ];
+          return Promise.resolve();
+        })
       );
 
       const entries = [{
@@ -528,6 +536,47 @@ describe("smoke: max_tokens continuation", () => {
       await advance(5000);
 
       expect(agent.prompt).toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("continues again when the hidden turn also reaches the token limit", async () => {
+    const { api, handlers, restore } = await setup();
+    try {
+      let attempt = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "length", content: [{ type: "text", text: "part one" }] }],
+        vi.fn().mockImplementation(() => {
+          attempt++;
+          agent.state.messages = attempt === 1
+            ? [{ role: "assistant", stopReason: "length", content: [{ type: "text", text: "part two" }] }]
+            : [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
+          return Promise.resolve();
+        }),
+      );
+
+      const entries = [{
+        type: "message",
+        message: { role: "assistant", stopReason: "length", content: [{ type: "text", text: "part one" }] },
+      }];
+      const ctx = createMockCtx(entries);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      await advance(8000);
+
+      expect(agent.prompt).toHaveBeenCalledTimes(2);
+      expect(api.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          customType: "pi-retry:continue",
+          content: "Continue exactly where you left off without repeating content.",
+          display: false,
+        }),
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
     } finally {
       restore();
     }

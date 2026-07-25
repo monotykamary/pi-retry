@@ -39,12 +39,12 @@ const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
  * - Automatic detection and retry for ALL errors (catch-all)
  * - Indefinite retry with exponential backoff (capped at 60s)
  * - Auto-continuation when model hits max output tokens (stopReason "length")
- * - ALL triggers are invisible — hidden AgentSession turns are filtered before the LLM call
+ * - Retry triggers are hidden in the TUI and serialized as provider-valid user turns
  * - Unified manual controls via /retry command
  *
  * Continuation mechanism:
  *   - A hidden custom message starts or joins a canonical AgentSession turn
- *   - A context hook removes that marker before provider serialization
+ *   - The message remains in context as a provider-valid user turn
  *   - AgentSession remains authoritative for busy state and queued messages
  *
  * Retry loop design:
@@ -166,33 +166,26 @@ function removeErrorFromAgentState(): void {
   }
 }
 
-// Check if the agent's last message indicates a retryable error.
-function lastMessageIsRetryableError(): boolean {
-  if (!_agent) return false;
+type HiddenTurnKind = "retry" | "continue";
+
+function getHiddenTurnKind(): HiddenTurnKind | null {
+  if (!_agent) return null;
   const messages = _agent.state.messages;
   const lastMsg = messages[messages.length - 1];
-  return lastMsg?.role === 'assistant' && lastMsg.stopReason === 'error';
+  if (lastMsg?.role !== "assistant") return null;
+  if (lastMsg.stopReason === "error") return "retry";
+  if (lastMsg.stopReason === "length") return "continue";
+  return null;
+}
+
+function lastMessageIsRetryableError(): boolean {
+  return getHiddenTurnKind() === "retry";
 }
 
 export default function (pi: ExtensionAPI) {
 
-  const markRealPromptStart = () => {
+  pi.on("input", () => {
     _inputGeneration++;
-  };
-  pi.on("input", (event) => {
-    if (event.source === "interactive" || event.source === "rpc") {
-      markRealPromptStart();
-    }
-  });
-  pi.on("before_agent_start", markRealPromptStart);
-
-  pi.on("context", (event) => {
-    const messages = event.messages.filter((message: any) => !(
-      message.role === "custom" &&
-      (message.customType === RETRY_TRIGGER_CUSTOM_TYPE ||
-        message.customType === CONTINUATION_CUSTOM_TYPE)
-    ));
-    if (messages.length !== event.messages.length) return { messages };
   });
 
   // Reset retry counters on successful completion (not max_tokens, not error)
@@ -254,14 +247,14 @@ export default function (pi: ExtensionAPI) {
       _continueInputGeneration === _inputGeneration
     ) return;
 
-    // Check for max_tokens stop — auto-continue (invisible to LLM)
+    // Check for max_tokens stop — auto-continue with a hidden TUI message
     if (hasMaxTokensStop(lastAssistant) && !stateContinuation.getIsContinuing()) {
       stateContinuation.startContinuation();
       ctx.ui.notify(
         `Max tokens reached — auto-continuing (continuation ${stateContinuation.getCount()})...`,
         "info",
       );
-      void triggerInvisibleContinue();
+      void triggerInvisibleContinue("continue");
       stateContinuation.endContinuation();
       return;
     }
@@ -308,7 +301,7 @@ export default function (pi: ExtensionAPI) {
       state.startRetry(errorMsg);
       state.endRetry();
 
-      void triggerInvisibleContinue();
+      void triggerInvisibleContinue("retry");
       return;
     }
 
@@ -363,7 +356,7 @@ export default function (pi: ExtensionAPI) {
         status += "Max Tokens Continuation:\n";
         status += `  Continuations used: ${stateContinuation.getCount()}\n`;
         status += `  Is continuing: ${stateContinuation.getIsContinuing()}\n`;
-        status += `  Trigger: hidden AgentSession turn (filtered before provider call)\n\n`;
+        status += `  Trigger: hidden provider-valid AgentSession turn\n\n`;
 
         // Config
         status += "Configuration:\n";
@@ -414,7 +407,7 @@ export default function (pi: ExtensionAPI) {
       // Auto-detect: max_tokens continuation takes priority
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
-        void triggerInvisibleContinue();
+        void triggerInvisibleContinue("continue");
         return;
       }
 
@@ -433,21 +426,21 @@ export default function (pi: ExtensionAPI) {
       if (has400or413Error(lastAssistant)) {
         ctx.ui.notify("Manually retrying 400/413 error...", "info");
         state400.reset();
-        void triggerInvisibleContinue();
+        void triggerInvisibleContinue("retry");
         return;
       }
 
       if (hasCreditError(lastAssistant)) {
         ctx.ui.notify("Manually retrying credit error...", "info");
         stateCredit.reset();
-        void triggerInvisibleContinue();
+        void triggerInvisibleContinue("retry");
         return;
       }
 
       if (hasConnectionError(lastAssistant)) {
         ctx.ui.notify("Manually retrying connection error...", "info");
         stateConnection.reset();
-        void triggerInvisibleContinue();
+        void triggerInvisibleContinue("retry");
         return;
       }
 
@@ -455,7 +448,7 @@ export default function (pi: ExtensionAPI) {
       if (hasRetryableError(lastAssistant)) {
         ctx.ui.notify("Manually retrying error...", "info");
         stateOther.reset();
-        void triggerInvisibleContinue();
+        void triggerInvisibleContinue("retry");
         return;
       }
 
@@ -505,9 +498,10 @@ export default function (pi: ExtensionAPI) {
   //
   // Unlike the original one-shot design, this function loops. After each
   // hidden AgentSession turn it checks the result:
-  //   - Success (stopReason !== "error"): loop exits, agent is done.
-  //   - Error (stopReason === "error"): sleep with backoff, then retry.
-  //   - User abort (stopReason "aborted"): loop exits immediately.
+  //   - Success: loop exits when the stop reason is neither error nor length.
+  //   - Error: sleep with backoff, then retry the request.
+  //   - Length: sleep with backoff, then continue the response.
+  //   - User abort: loop exits immediately.
   //
   // The backoff sleep happens AFTER the hidden turn settles and processEvents
   // has settled, so it does NOT block the agent. The agent is idle during
@@ -516,7 +510,7 @@ export default function (pi: ExtensionAPI) {
   // Before each retry, the error assistant message is removed from
   // agent.state.messages so the LLM receives a clean context (same
   // technique as the built-in retry's _prepareRetry).
-  async function triggerInvisibleContinue() {
+  async function triggerInvisibleContinue(initialKind: HiddenTurnKind) {
     if (!_agent) return;
 
     // Guard: if the user aborted, do not queue another retry turn.
@@ -550,6 +544,7 @@ export default function (pi: ExtensionAPI) {
       ) return;
 
       let attempt = 0;
+      let hiddenTurnKind: HiddenTurnKind | null = initialKind;
 
       // Loop until success, abort, or session change.
       while (true) {
@@ -560,8 +555,12 @@ export default function (pi: ExtensionAPI) {
         ) return;
 
         // Preserve the trigger kind before removing a trailing error from
-        // live state. The error remains in the session journal for history.
-        const isErrorRetry = lastMessageIsRetryableError();
+        // live state. Length-stopped output stays in context so the model can
+        // continue from it; error messages remain only in the session journal.
+        if (!hiddenTurnKind) {
+          didRetryComplete = true;
+          return;
+        }
         removeErrorFromAgentState();
 
         attempt++;
@@ -584,10 +583,12 @@ export default function (pi: ExtensionAPI) {
         try {
           pi.sendMessage(
             {
-              customType: isErrorRetry
+              customType: hiddenTurnKind === "retry"
                 ? RETRY_TRIGGER_CUSTOM_TYPE
                 : CONTINUATION_CUSTOM_TYPE,
-              content: [],
+              content: hiddenTurnKind === "retry"
+                ? "Retry the previous request."
+                : "Continue exactly where you left off without repeating content.",
               display: false,
               details: undefined,
             },
@@ -611,14 +612,13 @@ export default function (pi: ExtensionAPI) {
           _inputGeneration !== myInputGeneration
         ) return;
 
-        // The hidden AgentSession turn completed. Check the result.
-        if (!lastMessageIsRetryableError()) {
-          // Success or non-error terminal state — exit the loop.
+        // The hidden AgentSession turn completed. Both errors and output
+        // length stops need another turn; all other terminal states are done.
+        hiddenTurnKind = getHiddenTurnKind();
+        if (!hiddenTurnKind) {
           didRetryComplete = true;
           return;
         }
-
-        // Error again — loop back for another attempt.
       }
     } finally {
       // Release the mutex only if this loop still owns it.

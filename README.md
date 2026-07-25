@@ -25,7 +25,7 @@ This extension automatically detects and retries **all** errors by default, with
 | HTTP 400/413 | **Indefinite** with capped backoff, NO compaction | Transient context overflow that might resolve |
 | Credit / payment errors | **Indefinite** with capped backoff | "Not Enough Credits", insufficient balance, 402 |
 | Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
-| Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely (invisible — no prompt pollution) | Model hits output token limit mid-generation |
+| Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
 
 ---
 
@@ -48,10 +48,10 @@ This extension provides **automatic** infinite retry with sensible exponential b
 **Features:**
 - **Catch-all retry** — Any `stopReason: "error"` is retried, regardless of error message
 - Automatic detection of 400/413, connection, credit, and stream exhaustion errors
-- **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, **invisible** to the LLM
+- **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, hidden from the TUI
 - **Indefinite retry** — Keeps retrying until success
 - Exponential backoff with cap: max 60s between retries
-- **ALL triggers are invisible** — custom messages with `display: false`, stripped by context handler (no TUI clutter, no conversation pollution)
+- **Hidden triggers** — provider-valid custom messages use `display: false`, so retries do not add TUI clutter
 - Manual controls via unified `/retry` command
 - Non-retryable errors are explicitly logged so you know why we didn't retry
 
@@ -124,7 +124,7 @@ Edit the constants at the top of `retry.ts`:
 const BASE_DELAY_MS = 2000;        // Start with 2 seconds
 const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
 const BACKOFF_MULTIPLIER = 2;      // Double each time
-// Continuation is now invisible — no CONTINUATION_PROMPT needed
+// Continuations use a hidden provider-valid custom message
 ```
 
 ---
@@ -135,9 +135,9 @@ const BACKOFF_MULTIPLIER = 2;      // Double each time
 2. **Check for any error** — Examine the last assistant message for `stopReason === "error"`
 3. **Blacklist check** — Skip known permanent failures (invalid API key, model not found, etc.)
 4. **Categorize for messaging** — Classify into 400/413, credit, connection, or other for nice UI notifications
-5. **Retry or continue (both invisible)** — Wait (exponential backoff for errors), then trigger a new turn via `pi.sendMessage()` with `customType`, `display: false`, and `triggerTurn: true`
-6. **Context cleanup** — The `context` event strips all custom-type triggers before the LLM sees them (insurance against custom `convertToLlm` overrides)
-7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; each continuation produces valid output and the model naturally terminates when done
+5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true`
+6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
+7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
 8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
@@ -161,7 +161,7 @@ These are explicitly **not** retried:
 ### Max Tokens (stopReason: "length")
 - The model hit its `max_tokens` / output token limit
 - The model's response was truncated mid-generation
-- Auto-continuation sends an invisible custom message — no visible "Continue" prompt in the conversation
+- Auto-continuation sends a provider-valid custom message hidden from the TUI
 
 ### 400/413 Errors
 - HTTP 400 Bad Request
