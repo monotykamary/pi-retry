@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 import {
@@ -102,9 +103,10 @@ const stateOther = new RetryState();
 // Max_tokens continuation state (indefinite — no cap needed)
 const stateContinuation = new ContinuationState();
 
-// Abort flag: set when turn_end reports stopReason "aborted", cleared on
-// session_start and on fresh user activity.  Prevents triggerInvisibleContinue()
-// from starting a hidden retry turn after the user explicitly cancelled.
+// Abort flag: set when Pi's active signal is aborted or turn_end reports
+// stopReason "aborted", cleared on session_start and fresh user activity.
+// Prevents triggerInvisibleContinue() from starting a hidden retry turn after
+// the user explicitly cancelled, even if a tool/provider reports an error.
 let _userAborted = false;
 
 // Mutex: only one triggerInvisibleContinue may be in-flight at a time.
@@ -186,25 +188,32 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     _inputGeneration++;
+    // The generation change cancels any older loop; the new user request gets
+    // its own retry eligibility even if the previous request was aborted.
+    _userAborted = false;
   });
 
   // Reset retry counters on successful completion (not max_tokens, not error)
   pi.on("turn_end", async (event, ctx) => {
     const msg = event.message as any;
+    if (
+      ctx.signal?.aborted ||
+      (msg.role === "assistant" && msg.stopReason === "aborted")
+    ) {
+      // User cancelled — reset retry state so it doesn't leak into other
+      // branches of the session tree. The signal check matters for tool calls:
+      // some tools/providers finish with an error-shaped result after abort.
+      state400.reset();
+      stateCredit.reset();
+      stateConnection.reset();
+      stateOther.reset();
+      stateContinuation.endContinuation();
+      // Signal to any in-flight triggerInvisibleContinue or pending retry
+      // that the user has cancelled — do not queue another retry turn.
+      _userAborted = true;
+      return;
+    }
     if (msg.role === "assistant" && msg.stopReason !== "error") {
-      if (msg.stopReason === "aborted") {
-        // User cancelled — reset retry state so it doesn't leak into other
-        // branches of the session tree.
-        state400.reset();
-        stateCredit.reset();
-        stateConnection.reset();
-        stateOther.reset();
-        stateContinuation.endContinuation();
-        // Signal to any in-flight triggerInvisibleContinue or pending retry
-        // that the user has cancelled — do not queue another retry turn.
-        _userAborted = true;
-        return;
-      }
       if (msg.stopReason !== "length") {
         // Normal completion — reset everything including continuation count
         state400.succeed();
@@ -230,6 +239,14 @@ export default function (pi: ExtensionAPI) {
   // triggerInvisibleContinue(), which owns the retry loop with backoff
   // sleeps that happen AFTER processEvents returns (outside the agent run).
   pi.on("agent_end", async (event, ctx) => {
+    // Prefer Pi's run signal over provider-specific stop-reason mapping. An
+    // Escape during a Fabric/core tool may settle as an error-shaped result,
+    // but it is still a user cancellation and must never schedule a retry.
+    if (ctx.signal?.aborted) {
+      _userAborted = true;
+      return;
+    }
+
     const entries = ctx.sessionManager.getEntries();
     const lastAssistant = getLastAssistantMessage(entries);
 
@@ -480,16 +497,20 @@ export default function (pi: ExtensionAPI) {
     if (ctx.mode === "tui") {
       _terminalInputUnsubscribe = ctx.ui.onTerminalInput(data => {
         if (
-          data !== "\x1b" ||
+          !matchesKey(data, "escape") ||
           !_continueInProgress ||
           _continueGeneration !== _sessionGeneration
         ) {
           return undefined;
         }
 
+        // Cancel pi-retry's out-of-band loop, but let Pi's native interrupt
+        // handler receive the same key. Pi owns the active turn and queue: its
+        // handler aborts the current tool/model call and clears any queued
+        // steer/follow-up messages. Consuming Escape here bypasses that cleanup
+        // and can let AgentSession continue after the user asked it to stop.
         _userAborted = true;
-        ctx.abort();
-        return { consume: true };
+        return undefined;
       });
     }
   });

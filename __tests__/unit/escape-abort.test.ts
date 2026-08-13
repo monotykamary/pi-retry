@@ -86,6 +86,13 @@ async function setup() {
   let terminalInputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   const terminalInputUnsubscribe = vi.fn();
   const abort = vi.fn(() => resolvePrompt?.());
+  const queuedFollowUps = ["queued continuation"];
+  let abortController = new AbortController();
+  const nativeInterrupt = vi.fn(() => {
+    queuedFollowUps.length = 0;
+    abortController.abort();
+    resolvePrompt?.();
+  });
   const entries = [errorEntry("Connection error")];
   const ctx = {
     mode: "tui",
@@ -100,6 +107,9 @@ async function setup() {
       getEntries: vi.fn().mockReturnValue(entries),
     },
     isIdle: () => true,
+    get signal() {
+      return abortController.signal;
+    },
     abort,
   } as unknown as ExtensionContext;
 
@@ -110,6 +120,24 @@ async function setup() {
   }
 
   await startSession();
+
+  function pressEscape(data = "\x1b"): void {
+    const result = terminalInputHandler?.(data);
+    if (!result?.consume) nativeInterrupt();
+  }
+
+  async function fireInput(): Promise<void> {
+    abortController = new AbortController();
+    for (const handler of handlers.input ?? []) {
+      await handler({ source: "interactive", text: "new work" }, ctx);
+    }
+  }
+
+  async function fireTurnEnd(message: object): Promise<void> {
+    for (const handler of handlers.turn_end ?? []) {
+      await handler({ message }, ctx);
+    }
+  }
 
   function fireAgentEnd(): void {
     for (const handler of handlers.agent_end ?? []) {
@@ -129,7 +157,12 @@ async function setup() {
     abort,
     agent,
     fireAgentEnd,
+    fireInput,
+    fireTurnEnd,
     getTerminalInputHandler: () => terminalInputHandler,
+    nativeInterrupt,
+    pressEscape,
+    queuedFollowUps,
     restore,
     startSession,
   };
@@ -145,9 +178,10 @@ describe("retry Escape handling", () => {
       expect(fixture.agent.prompt).toHaveBeenCalledTimes(1);
       expect(fixture.agent.state.isStreaming).toBe(true);
 
-      const result = fixture.getTerminalInputHandler()?.("\x1b");
-      expect(result).toEqual({ consume: true });
-      expect(fixture.abort).toHaveBeenCalledTimes(1);
+      fixture.pressEscape();
+      expect(fixture.nativeInterrupt).toHaveBeenCalledTimes(1);
+      expect(fixture.queuedFollowUps).toEqual([]);
+      expect(fixture.abort).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(60000);
       expect(fixture.agent.state.isStreaming).toBe(false);
@@ -163,12 +197,52 @@ describe("retry Escape handling", () => {
       fixture.fireAgentEnd();
       await vi.advanceTimersByTimeAsync(500);
 
-      const result = fixture.getTerminalInputHandler()?.("\x1b");
-      expect(result).toEqual({ consume: true });
-      expect(fixture.abort).toHaveBeenCalledTimes(1);
+      fixture.pressEscape();
+      expect(fixture.nativeInterrupt).toHaveBeenCalledTimes(1);
+      expect(fixture.queuedFollowUps).toEqual([]);
+      expect(fixture.abort).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(5000);
       expect(fixture.agent.prompt).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it("does not retry an error-shaped result when Pi's run signal was aborted", async () => {
+    const fixture = await setup();
+    try {
+      fixture.pressEscape("\x1b[27u");
+      await fixture.fireTurnEnd({
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "Execution cancelled",
+        content: [],
+      });
+      fixture.fireAgentEnd();
+
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(fixture.agent.prompt).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it("allows a fresh user request to retry after an earlier abort", async () => {
+    const fixture = await setup();
+    try {
+      fixture.pressEscape("\x1b[27u");
+      await fixture.fireTurnEnd({
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "Execution cancelled",
+        content: [],
+      });
+      await fixture.fireInput();
+      fixture.fireAgentEnd();
+
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(fixture.agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       fixture.restore();
     }
