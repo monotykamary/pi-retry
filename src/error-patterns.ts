@@ -131,6 +131,56 @@ const SILENCED_PATTERNS = [
   /cannot continue from message role/i,
 ];
 
+// Quota / session-limit / budget exhaustion — hard stops:
+// retrying is pointless until the user upgrades, tops up a budget, or waits
+// out a reset window measured in hours/days. Distinct from per-minute rate
+// limits and pay-as-you-go balance errors, which stay retryable.
+//
+// Evidence (real provider messages):
+// - Claude Code:  "You've hit your limit · resets 4pm (Asia/Kuala_Lumpur)"
+//                 "Claude usage limit reached. Your limit will reset at 3pm"
+//                 "5-hour limit reached · resets 12pm"
+// - Codex:        "You've hit your usage limit. Upgrade to Plus"
+//                 "You've exceeded your usage limit."
+// - OpenAI:       code "insufficient_quota" — "You exceeded your current
+//                 quota, please check your plan and billing details"
+// - Gemini:       same sentence in 429 RESOURCE_EXHAUSTED responses; only
+//                 reaches us after pi's built-in 429 retry gives up
+// - OpenRouter:   "Rate limit exceeded: free-models-per-day. ..."
+// - Alibaba:      "Allocated quota exceeded, please increase your quota limit"
+//                 (Throttling.AllocationQuota — hard cap; RateQuota is
+//                 transient and stays retryable)
+// - Copilot:      "You have exceeded your premium request allowance"
+// - LiteLLM:      "Budget has been exceeded! Current cost: …, Max budget: …"
+// - Kimi:         "Your account {org}<{ak}> is suspended, please check your
+//                 plan and billing details" (exceeded_current_quota_error)
+export const QUOTA_EXHAUSTED_PATTERNS = [
+  // Session / usage limits with reset windows (Claude, Codex)
+  /hit your (usage )?limit/i,
+  /usage\s*limit\s*(has\s*been\s*)?reached/i,
+  /hour\s*limit\s*reached/i, // "5-hour limit reached" — must NOT hit DeepSeek 429 "Rate Limit Reached"
+  /limit\s*will\s*reset\s*at/i,
+  /session\s*(limit|quota)/i,
+  /exceeded your usage limit/i,
+  // Billing / plan quotas (OpenAI insufficient_quota, Gemini RESOURCE_EXHAUSTED)
+  /insufficient[_\s]quota/i,
+  /exceeded your current quota/i, // Kimi's "...current token quota" (balance, retryable) intentionally not matched
+  // Hard allotments
+  /free.models.per.day/i, // OpenRouter free-tier daily pool
+  /allocated\s*quota/i, // Alibaba Throttling.AllocationQuota
+  /premium\s*request\s*allowance/i, // GitHub Copilot monthly allowance
+  /monthly\s*(limit|quota|budget|allowance)/i,
+  // Budget exhaustion (LiteLLM and similar proxies/gateways)
+  /out of budget/i,
+  /budget\s*(has\s*been\s*)?(exceeded|exhausted|limit)/i,
+  /max(imum)?\s*budget\s*(exceeded|reached|limit)/i,
+  /spending\s*limit/i,
+  // Suspended accounts (Kimi exceeded_current_quota_error suspended form)
+  /account\b[^.]*\bis\s*suspended/i,
+  // Generic
+  /quota\s*(exhausted|depleted)/i,
+];
+
 // ── Type guard ──
 
 export function isAssistantMessage(message: AgentMessage): message is Extract<AgentMessage, { role: "assistant" }> {
@@ -184,7 +234,7 @@ export function isContextOverflowError(message: AgentMessage): boolean {
 export function hasRetryableError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return !NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!));
+  return !isNonRetryableError(message);
 }
 
 /**
@@ -193,7 +243,26 @@ export function hasRetryableError(message: AgentMessage): boolean {
 export function isNonRetryableError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!));
+  return (
+    NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!)) ||
+    QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!))
+  );
+}
+
+/**
+ * Returns true for quota / session-limit / budget exhaustion errors where
+ * retrying is pointless until the user acts (upgrade, top up a budget) or a
+ * long reset window passes (hours/days). Treated as non-retryable.
+ *
+ * Deliberately NOT matched: per-minute rate limits (429s) and pay-as-you-go
+ * balance errors (DeepSeek "Insufficient Balance", OpenRouter "Insufficient
+ * credits", Kimi "exceeded your current token quota") — those stay retryable
+ * so a mid-session top-up auto-resumes.
+ */
+export function hasQuotaExhaustedError(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  return QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 /**
@@ -209,7 +278,8 @@ export function isSilencedError(message: AgentMessage): boolean {
 
 // ── Categorisation (for UI messages) ──
 
-export function getErrorCategory(errorMessage: string): '400-413' | 'credit' | 'connection' | 'builtin' | 'other' {
+export function getErrorCategory(errorMessage: string): '400-413' | 'credit' | 'connection' | 'builtin' | 'quota' | 'other' {
+  if (QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(errorMessage))) return 'quota';
   if (ERROR_400_413_PATTERNS.some(p => p.test(errorMessage))) return '400-413';
   if (CREDIT_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'credit';
   if (CONNECTION_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'connection';

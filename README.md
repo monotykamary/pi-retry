@@ -23,7 +23,8 @@ This extension automatically detects and retries **all** errors by default, with
 |------------|----------------|----------|
 | **Any retryable error** (catch-all) | **Indefinite** with capped backoff | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
 | HTTP 400/413 | **Indefinite** with capped backoff, NO compaction | Transient context overflow that might resolve |
-| Credit / payment errors | **Indefinite** with capped backoff | "Not Enough Credits", insufficient balance, 402 |
+| Credit / payment errors | **Indefinite** with capped backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
+| **Quota / session-limit / budget exhaustion** | **Not retried** — notify + stop | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
 | Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
 | Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
 
@@ -50,6 +51,7 @@ This extension provides **automatic** infinite retry with sensible exponential b
 - Automatic detection of 400/413, connection, credit, and stream exhaustion errors
 - **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, hidden from the TUI
 - **Indefinite retry** — Keeps retrying until success
+- **Auto-stop on quota/budget exhaustion** — Session limits, plan quotas, and budget caps ("You've hit your limit", "out of budget", `insufficient_quota`, suspended accounts) are detected and **not** retried, with a notification explaining why
 - Exponential backoff with cap: max 60s between retries
 - **Hidden triggers** — provider-valid custom messages use `display: false`, so retries do not add TUI clutter
 - Manual controls via unified `/retry` command
@@ -133,7 +135,7 @@ const BACKOFF_MULTIPLIER = 2;      // Double each time
 
 1. **Listen to `agent_end` event** — Fires after each agent turn completes
 2. **Check for any error** — Examine the last assistant message for `stopReason === "error"`
-3. **Blacklist check** — Skip known permanent failures (invalid API key, model not found, etc.)
+3. **Blacklist check** — Skip known permanent failures (invalid API key, model not found, quota/session-limit/budget exhaustion, suspended accounts, etc.)
 4. **Categorize for messaging** — Classify into 400/413, credit, connection, or other for nice UI notifications
 5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true`
 6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
@@ -157,6 +159,16 @@ These are explicitly **not** retried:
 - API key not found / missing / revoked
 - Model not found / unknown model / no such model / model does not exist
 - Unsupported model
+
+### Non-Retryable (Quota / Session Limit / Budget)
+Exhausted quotas, session limits, and budgets are auto-detected and stop the retry loop (with an explanatory notification), because retrying is pointless until you act or the reset window passes:
+- **Usage / session limits with reset windows** — "You've hit your limit · resets …" and "5-hour limit reached" (Claude Code), "You've hit your usage limit" / "You've exceeded your usage limit" (Codex)
+- **Plan / billing quotas** — OpenAI `insufficient_quota`, "You exceeded your current quota, please check your plan and billing details" (OpenAI, Gemini — reached only after pi's built-in 429 retry gives up)
+- **Hard allotments** — OpenRouter `free-models-per-day`, Alibaba "Allocated quota exceeded" (`Throttling.AllocationQuota`), GitHub Copilot "premium request allowance"
+- **Budget exhaustion** — "out of budget", "Budget has been exceeded" (LiteLLM-style proxies), max/spending/monthly limits
+- **Suspended accounts** — "Your account … is suspended" (Kimi `exceeded_current_quota_error`)
+
+Deliberate distinction: plain pay-as-you-go **balance** errors stay retryable — DeepSeek 402 "Insufficient Balance", OpenRouter 402 "Insufficient credits", Kimi "exceeded your current token quota". A mid-session top-up lets the retry loop auto-resume, whereas session limits and budgets do not self-resolve for hours.
 
 ### Max Tokens (stopReason: "length")
 - The model hit its `max_tokens` / output token limit
@@ -291,7 +303,7 @@ pi install npm:@georgebashi/pi-retry
 - Error messages remain in the session history (but are invisible to the LLM)
 - May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
 - **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large
-- Non-retryable errors (invalid API key, missing model) are logged but not retried — you'll need to fix the underlying issue
+- Non-retryable errors (invalid API key, missing model, quota/session-limit/budget exhaustion) are logged but not retried — you'll need to fix the underlying issue, then use `/retry`
 
 ---
 

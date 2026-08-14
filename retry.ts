@@ -9,6 +9,7 @@ import {
   hasRetryableError,
   isNonRetryableError,
   isSilencedError,
+  hasQuotaExhaustedError,
   hasMaxTokensStop,
   isContextOverflowError,
   isAssistantMessage,
@@ -30,8 +31,9 @@ const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
  * Unified retry extension — retries EVERY error by default.
  *
  * Philosophy: any assistant message with stopReason === "error" is retried
- * indefinitely with exponential backoff, except a tiny blacklist of known
- * permanent failures (invalid API key, model not found, etc.).
+ * indefinitely with exponential backoff, except a small blacklist of known
+ * permanent failures and hard-stop conditions (invalid API key, model not
+ * found, quota/session-limit/budget exhaustion, suspended accounts, etc.).
  *
  * Specific categories (400/413, credit, connection, stream exhaustion, etc.)
  * are tracked for diagnostics but all share the same retry mechanism.
@@ -326,7 +328,12 @@ export default function (pi: ExtensionAPI) {
     // (silenced errors are neither retried nor shown)
     if (isNonRetryableError(lastAssistant) && !isSilencedError(lastAssistant)) {
       const errorMsg = lastAssistant.errorMessage || "Unknown error";
-      ctx.ui.notify(`Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`, "error");
+      ctx.ui.notify(
+        hasQuotaExhaustedError(lastAssistant)
+          ? `Quota/limit exhausted — not retrying (fix plan/billing or wait for the reset window, then /retry): ${errorMsg.substring(0, 100)}`
+          : `Non-retryable error (not retried): ${errorMsg.substring(0, 100)}`,
+        "error",
+      );
     }
   });
 
@@ -435,6 +442,19 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(
           "Context overflow — use /compact (or /pi-vcc) to reduce context. Compaction auto-retries.",
           "info",
+        );
+        return;
+      }
+
+      // Non-retryable errors (permanent failures + quota/budget
+      // exhaustion): report clearly instead of the generic fallback.
+      if (isNonRetryableError(lastAssistant)) {
+        const errorMsg = lastAssistant.errorMessage || "Unknown error";
+        ctx.ui.notify(
+          hasQuotaExhaustedError(lastAssistant)
+            ? `Quota/limit exhausted — resolve the plan/billing issue or wait for the reset window first: ${errorMsg.substring(0, 100)}`
+            : `Non-retryable error (fix the underlying issue first, then /retry): ${errorMsg.substring(0, 100)}`,
+          "warning",
         );
         return;
       }

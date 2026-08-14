@@ -11,6 +11,7 @@ import {
   hasRetryableError,
   isNonRetryableError,
   isSilencedError,
+  hasQuotaExhaustedError,
   hasMaxTokensStop,
   isContextOverflowError,
   getErrorCategory,
@@ -409,6 +410,122 @@ describe('hasMaxTokensStop', () => {
   it('returns false for toolResult messages', () => {
     const msg = { role: 'toolResult', content: [] } as unknown as AgentMessage;
     expect(hasMaxTokensStop(msg)).toBe(false);
+  });
+});
+
+describe('hasQuotaExhaustedError', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  it('detects Claude Code session / weekly limit variants', () => {
+    expect(hasQuotaExhaustedError(createAssistantError("You've hit your limit · resets 4pm (Asia/Kuala_Lumpur)"))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError("You've hit your limit for Claude messages. Limits will reset at 3:00 AM."))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('Claude usage limit reached. Your limit will reset at 3pm'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('5-hour limit reached · resets 12pm'))).toBe(true);
+  });
+
+  it('detects Codex / ChatGPT plan limits', () => {
+    expect(hasQuotaExhaustedError(createAssistantError("You've hit your usage limit. Upgrade to Plus"))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError("You've exceeded your usage limit."))).toBe(true);
+  });
+
+  it('detects OpenAI platform insufficient_quota', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors. (insufficient_quota)'))).toBe(true);
+  });
+
+  it('detects Gemini plan quota (reaches us after built-in 429 retries give up)', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.dev/rate-limit.'))).toBe(true);
+  });
+
+  it('detects OpenRouter free-tier daily pool', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day'))).toBe(true);
+  });
+
+  it('detects Alibaba allocation quota (hard cap)', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('Allocated quota exceeded, please increase your quota limit'))).toBe(true);
+  });
+
+  it('detects GitHub Copilot premium allowance exhaustion', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('You have exceeded your premium request allowance.'))).toBe(true);
+  });
+
+  it('detects budget exhaustion (LiteLLM-style proxies)', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('Budget has been exceeded! Current cost: 0.5, Max budget: 0.4'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('out of budget'))).toBe(true);
+  });
+
+  it('detects suspended accounts (Kimi exceeded_current_quota_error)', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('Your account org-123<ak-xyz> is suspended, please check your plan and billing details'))).toBe(true);
+  });
+
+  it('returns false for non-error messages', () => {
+    const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
+    expect(hasQuotaExhaustedError(msg)).toBe(false);
+  });
+});
+
+describe('quota errors are not retried', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  it('hasRetryableError returns false for quota errors', () => {
+    expect(hasRetryableError(createAssistantError("You've hit your limit · resets 4pm"))).toBe(false);
+    expect(hasRetryableError(createAssistantError('out of budget'))).toBe(false);
+  });
+
+  it('isNonRetryableError returns true for quota errors', () => {
+    expect(isNonRetryableError(createAssistantError("You've hit your usage limit. Upgrade to Plus"))).toBe(true);
+    expect(isNonRetryableError(createAssistantError('Budget has been exceeded! Current cost: 0.5, Max budget: 0.4'))).toBe(true);
+  });
+
+  it('getErrorCategory returns quota (checked before builtin rate-limit)', () => {
+    expect(getErrorCategory("You've hit your limit · resets 4pm")).toBe('quota');
+    expect(getErrorCategory('out of budget')).toBe('quota');
+    expect(getErrorCategory('Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day')).toBe('quota');
+  });
+});
+
+describe('quota patterns do not false-positive on transient/balance errors', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  it('Anthropic transient rate-limit messages stay retryable', () => {
+    const msg1 = createAssistantError("This request would exceed your account's rate limit");
+    const msg2 = createAssistantError('Server is temporarily limiting requests (not your usage limit) · Rate limited');
+    expect(hasQuotaExhaustedError(msg1)).toBe(false);
+    expect(hasRetryableError(msg1)).toBe(true);
+    expect(hasQuotaExhaustedError(msg2)).toBe(false);
+    expect(hasRetryableError(msg2)).toBe(true);
+  });
+
+  it('per-minute rate limits stay retryable', () => {
+    const msg1 = createAssistantError('Rate limit exceeded');
+    const msg2 = createAssistantError('Rate Limit Reached'); // DeepSeek 429
+    const msg3 = createAssistantError('Your account org<ak> request reached organization TPD rate limit,current:10, limit:5'); // Kimi TPD
+    expect(hasQuotaExhaustedError(msg1)).toBe(false);
+    expect(hasRetryableError(msg1)).toBe(true);
+    expect(hasQuotaExhaustedError(msg2)).toBe(false);
+    expect(hasRetryableError(msg2)).toBe(true);
+    expect(hasQuotaExhaustedError(msg3)).toBe(false);
+    expect(hasRetryableError(msg3)).toBe(true);
+  });
+
+  it('pay-as-you-go balance errors stay retryable (top-up auto-resume)', () => {
+    const msg1 = createAssistantError('Insufficient Balance'); // DeepSeek 402
+    const msg2 = createAssistantError('Insufficient credits. To increase, visit https://openrouter.ai/settings/credits and add more credits'); // OpenRouter 402
+    const msg3 = createAssistantError('You exceeded your current token quota: <org-1> 100, please check your account balance'); // Kimi balance quota
+    expect(hasQuotaExhaustedError(msg1)).toBe(false);
+    expect(hasRetryableError(msg1)).toBe(true);
+    expect(hasQuotaExhaustedError(msg2)).toBe(false);
+    expect(hasRetryableError(msg2)).toBe(true);
+    expect(hasQuotaExhaustedError(msg3)).toBe(false);
+    expect(hasRetryableError(msg3)).toBe(true);
+  });
+
+  it('engine overloaded stays retryable (Kimi engine_overloaded_error)', () => {
+    const msg = createAssistantError('The engine is currently overloaded, please try again later');
+    expect(hasQuotaExhaustedError(msg)).toBe(false);
+    expect(hasRetryableError(msg)).toBe(true);
   });
 });
 
