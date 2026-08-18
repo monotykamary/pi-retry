@@ -429,6 +429,28 @@ describe('hasQuotaExhaustedError', () => {
     expect(hasQuotaExhaustedError(createAssistantError("You've exceeded your usage limit."))).toBe(true);
   });
 
+  it('detects ChatGPT plan-cap messages (provider name between "your" and "usage limit")', () => {
+    // The screenshot case: backed off forever despite a multi-day reset window
+    expect(hasQuotaExhaustedError(createAssistantError('You have hit your ChatGPT usage limit (plus plan). Try again in ~5330 min.'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('You have hit your ChatGPT usage limit (go plan). Try again in ~81 min.'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError("You've hit your usage limit, try again in 4 days 2 hours 46 minutes"))).toBe(true);
+  });
+
+  it('detects Codex backend 429 usage_limit_reached', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('HTTP 429: The usage limit has been reached (error.type=usage_limit_reached)'))).toBe(true);
+  });
+
+  it('detects Google subscription caps (Gemini Code Assist / Antigravity)', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('You have exhausted your capacity on this model. Your quota will reset after 8h44m7s.'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('Model quota limit exceeded. You have reached the quota limit for Claude Sonnet 4.5 (Thinking). You can resume using this model at 1/28/2026, 9:20:40 AM.'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('You can resume using this model at 2/15/2026, 11:19:09 PM.'))).toBe(true);
+  });
+
+  it('detects z.ai GLM coding plan window exhaustion', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('HTTP 429: Usage limit reached for 5 hour. Your limit will reset at 2026-05-30 22:00:45'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('HTTP 429: {"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}'))).toBe(true);
+  });
+
   it('detects OpenAI platform insufficient_quota', () => {
     expect(hasQuotaExhaustedError(createAssistantError('You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors. (insufficient_quota)'))).toBe(true);
   });
@@ -502,12 +524,15 @@ describe('quota patterns do not false-positive on transient/balance errors', () 
     const msg1 = createAssistantError('Rate limit exceeded');
     const msg2 = createAssistantError('Rate Limit Reached'); // DeepSeek 429
     const msg3 = createAssistantError('Your account org<ak> request reached organization TPD rate limit,current:10, limit:5'); // Kimi TPD
+    const msg4 = createAssistantError("You've hit your rate limit — slow down and try again shortly"); // burst RPM wording, not plan exhaustion
     expect(hasQuotaExhaustedError(msg1)).toBe(false);
     expect(hasRetryableError(msg1)).toBe(true);
     expect(hasQuotaExhaustedError(msg2)).toBe(false);
     expect(hasRetryableError(msg2)).toBe(true);
     expect(hasQuotaExhaustedError(msg3)).toBe(false);
     expect(hasRetryableError(msg3)).toBe(true);
+    expect(hasQuotaExhaustedError(msg4)).toBe(false);
+    expect(hasRetryableError(msg4)).toBe(true);
   });
 
   it('pay-as-you-go balance errors stay retryable (top-up auto-resume)', () => {

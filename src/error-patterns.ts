@@ -142,10 +142,19 @@ const SILENCED_PATTERNS = [
 //                 "5-hour limit reached · resets 12pm"
 // - Codex:        "You've hit your usage limit. Upgrade to Plus"
 //                 "You've exceeded your usage limit."
+// + ChatGPT subscription plan caps (surfaced from chatgpt.com backend,
+//   observed via codex providers): "You have hit your ChatGPT usage limit
+//   (plus plan). Try again in ~5330 min." — plan name in parens varies
+//   (go/plus/pro/team); also arrives as HTTP 429 "The usage limit has been
+//   reached" with error.type `usage_limit_reached`
 // - OpenAI:       code "insufficient_quota" — "You exceeded your current
 //                 quota, please check your plan and billing details"
 // - Gemini:       same sentence in 429 RESOURCE_EXHAUSTED responses; only
 //                 reaches us after pi's built-in 429 retry gives up
+//   + Google AI Pro/Ultra subscription caps: "You have exhausted your
+//     capacity on this model. Your quota will reset after 8h44m7s." (Code
+//     Assist), "You have reached the quota limit for Claude Sonnet 4.5
+//     (Thinking). You can resume using this model at …" (Antigravity)
 // - OpenRouter:   "Rate limit exceeded: free-models-per-day. ..."
 // - Alibaba:      "Allocated quota exceeded, please increase your quota limit"
 //                 (Throttling.AllocationQuota — hard cap; RateQuota is
@@ -154,9 +163,21 @@ const SILENCED_PATTERNS = [
 // - LiteLLM:      "Budget has been exceeded! Current cost: …, Max budget: …"
 // - Kimi:         "Your account {org}<{ak}> is suspended, please check your
 //                 plan and billing details" (exceeded_current_quota_error)
+// - z.ai GLM:     "Usage limit reached for 5 hour. Your limit will reset at
+//                 …" (5-hour window, matches usage-limit-reached above) and
+//                 429 code 1113 "Insufficient balance or no resource package.
+//                 Please recharge." (Coding Plan quota drained — unlike plain
+//                 balance errors this needs a window reset or plan change)
+//
+// Deliberately retryable (verified, kept out): DeepSeek 402 "Insufficient
+// Balance" and 429 "Rate Limit Reached" (concurrency), Kimi TPD org limits
+// and "exceeded your current token quota" (balance). See the note on
+// hasQuotaExhaustedError below.
 export const QUOTA_EXHAUSTED_PATTERNS = [
-  // Session / usage limits with reset windows (Claude, Codex)
-  /hit your (usage )?limit/i,
+  // Session / usage limits with reset windows (Claude, Codex, ChatGPT plans)
+  /hit your (?:[a-z]+ )?usage limit/i, // "…hit your usage limit", "…hit your ChatGPT usage limit (plus plan)" — the optional word is the provider name; "hit your rate limit" intentionally NOT matched (burst limit stays retryable)
+  /hit your limit/i,
+  /usage_limit_reached/i, // Codex backend 429 error.type surfaced in the body
   /usage\s*limit\s*(has\s*been\s*)?reached/i,
   /hour\s*limit\s*reached/i, // "5-hour limit reached" — must NOT hit DeepSeek 429 "Rate Limit Reached"
   /limit\s*will\s*reset\s*at/i,
@@ -175,6 +196,13 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
   /budget\s*(has\s*been\s*)?(exceeded|exhausted|limit)/i,
   /max(imum)?\s*budget\s*(exceeded|reached|limit)/i,
   /spending\s*limit/i,
+  // Google subscription caps (Gemini Code Assist, Antigravity)
+  /exhausted your capacity/i, // "You have exhausted your capacity on this model."
+  /quota will reset after/i, // "Your quota will reset after 8h44m7s."
+  /reached the quota limit/i, // Antigravity "You have reached the quota limit for Gemini 3 Pro (High)"
+  /you can resume using this model/i, // Antigravity resume tail when the lead-in is truncated
+  // z.ai / GLM Coding Plan window exhaustion (429 code 1113)
+  /no resource package/i, // "Insufficient balance or no resource package. Please recharge."
   // Suspended accounts (Kimi exceeded_current_quota_error suspended form)
   /account\b[^.]*\bis\s*suspended/i,
   // Generic
