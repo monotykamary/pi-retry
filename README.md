@@ -165,7 +165,7 @@ Exhausted quotas, session limits, and budgets are auto-detected and stop the ret
 - **Usage / session limits with reset windows** — "You've hit your limit · resets …" and "5-hour limit reached" (Claude Code), "You've hit your usage limit" / "You've exceeded your usage limit" (Codex), "You have hit your ChatGPT usage limit (plus plan)" (ChatGPT subscription caps via the Codex backend, also `usage_limit_reached`)
 - **Plan / billing quotas** — OpenAI `insufficient_quota`, "You exceeded your current quota, please check your plan and billing details" (OpenAI, Gemini — reached only after pi's built-in 429 retry gives up)
 - **Google subscription caps** — "You have exhausted your capacity on this model. Your quota will reset after …" (Gemini Code Assist), "You have reached the quota limit for …" / "You can resume using this model at …" (Antigravity)
-- **Hard allotments** — OpenRouter `free-models-per-day`, Alibaba "Allocated quota exceeded" (`Throttling.AllocationQuota`), GitHub Copilot "premium request allowance", z.ai GLM Coding Plan "Usage limit reached for 5 hour" / "no resource package"
+- **Hard allotments** — OpenRouter `free-models-per-day`, Alibaba Coding Plan window quotas "hour/week/month allocated quota exceeded" and free-quota exhaustion "free allocated quota exceeded" (the bare "Allocated quota exceeded" is TPM rate limiting and stays retryable), GitHub Copilot "premium request allowance", z.ai GLM Coding Plan "Usage limit reached for 5 hour" / "no resource package"
 - **Budget exhaustion** — "out of budget", "Budget has been exceeded" (LiteLLM-style proxies), max/spending/monthly limits
 - **Suspended accounts** — "Your account … is suspended" (Kimi `exceeded_current_quota_error`)
 
