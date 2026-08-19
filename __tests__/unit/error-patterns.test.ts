@@ -463,8 +463,18 @@ describe('hasQuotaExhaustedError', () => {
     expect(hasQuotaExhaustedError(createAssistantError('Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day'))).toBe(true);
   });
 
-  it('detects Alibaba allocation quota (hard cap)', () => {
-    expect(hasQuotaExhaustedError(createAssistantError('Allocated quota exceeded, please increase your quota limit'))).toBe(true);
+  it('keeps Alibaba TPM rate limiting retryable (not a hard quota)', () => {
+    const msg = createAssistantError('Allocated quota exceeded, please increase your quota limit');
+    expect(hasQuotaExhaustedError(msg)).toBe(false);
+    expect(isNonRetryableError(msg)).toBe(false);
+    expect(hasRetryableError(msg)).toBe(true);
+  });
+
+  it('detects Alibaba hard quota variants (Coding Plan windows / free quota)', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('hour allocated quota exceeded'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('week allocated quota exceeded'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('month allocated quota exceeded'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('free allocated quota exceeded'))).toBe(true);
   });
 
   it('detects GitHub Copilot premium allowance exhaustion', () => {
