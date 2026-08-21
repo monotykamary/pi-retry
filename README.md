@@ -27,6 +27,7 @@ This extension automatically detects and retries **all** errors by default, with
 | **Quota / session-limit / budget exhaustion** | **Not retried** — notify + stop | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
 | Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
 | Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
+| Empty / think-only stop (`stopReason: "stop"` with no text or tool calls) | **Nudge once** with a hidden continuation, then give up | Model ends its turn with no usable output (Anthropic empty responses with end_turn, thinking-only turns) |
 
 ---
 
@@ -140,6 +141,7 @@ const BACKOFF_MULTIPLIER = 2;      // Double each time
 5. **Retry or continue with hidden turns** — Wait with exponential backoff, then trigger a provider-valid custom user turn via `pi.sendMessage()` with `display: false` and `triggerTurn: true`
 6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
 7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
+8. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
 8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.

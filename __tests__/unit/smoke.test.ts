@@ -583,6 +583,83 @@ describe("smoke: max_tokens continuation", () => {
   });
 });
 
+
+// ── Edge case: empty / think-only stop ──
+
+describe("smoke: empty/think-only stop", () => {
+  it("nudges once when the turn has only thinking content", async () => {
+    const { api, handlers, restore } = await setup();
+    try {
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "let me think..." }] }],
+        vi.fn().mockImplementation(() => {
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          ];
+          return Promise.resolve();
+        })
+      );
+
+      const entries = [{
+        type: "message",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "let me think..." }] },
+      }];
+      const ctx = createMockCtx(entries);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      await advance(5000);
+
+      expect(api.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          customType: "pi-retry:continue",
+          display: false,
+          content: "Your previous turn contained only thinking and no answer or text. Continue now and produce the actual response, using tools if needed.",
+        }),
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("refuses to loop forever — gives up after MAX_EMPTY_CONTINUATIONS empty turns", async () => {
+    const { api, handlers, restore } = await setup();
+    try {
+      let attempt = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "stop", content: [] }],
+        vi.fn().mockImplementation(() => {
+          attempt++;
+          // keep answering with empty content; model is broken
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [] },
+          ];
+          return Promise.resolve();
+        })
+      );
+
+      const entries = [{
+        type: "message",
+        message: { role: "assistant", stopReason: "stop", content: [] },
+      }];
+      const ctx = createMockCtx(entries);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      await advance(15000);
+
+      // MAX_EMPTY_CONTINUATIONS = 1 → exactly one nudge turn, then give up
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+});
 // ── Edge case: /retry command ──
 
 describe("smoke: /retry command", () => {

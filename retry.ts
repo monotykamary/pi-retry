@@ -11,6 +11,7 @@ import {
   isSilencedError,
   hasQuotaExhaustedError,
   hasMaxTokensStop,
+  hasEmptyStop,
   isContextOverflowError,
   isAssistantMessage,
   getLastAssistantMessage,
@@ -105,6 +106,14 @@ const stateOther = new RetryState();
 // Max_tokens continuation state (indefinite — no cap needed)
 const stateContinuation = new ContinuationState();
 
+// Empty/think-only stop continuation state — BOUNDED by design: the model
+// decided to end its turn with no usable output (zero text, zero tool
+// calls; Anthropic's documented "empty responses with end_turn"/reasoning
+// budget exhaustion). It gets ONE nudge, then we give up rather than
+// burning tokens looping on a model that has decided it is done.
+const stateEmptyStop = new ContinuationState();
+const MAX_EMPTY_CONTINUATIONS = 1;
+
 // Abort flag: set when Pi's active signal is aborted or turn_end reports
 // stopReason "aborted", cleared on session_start and fresh user activity.
 // Prevents triggerInvisibleContinue() from starting a hidden retry turn after
@@ -170,7 +179,7 @@ function removeErrorFromAgentState(): void {
   }
 }
 
-type HiddenTurnKind = "retry" | "continue";
+type HiddenTurnKind = "retry" | "continue" | "empty";
 
 function getHiddenTurnKind(): HiddenTurnKind | null {
   if (!_agent) return null;
@@ -179,6 +188,7 @@ function getHiddenTurnKind(): HiddenTurnKind | null {
   if (lastMsg?.role !== "assistant") return null;
   if (lastMsg.stopReason === "error") return "retry";
   if (lastMsg.stopReason === "length") return "continue";
+  if (hasEmptyStop(lastMsg)) return "empty";
   return null;
 }
 
@@ -210,6 +220,7 @@ export default function (pi: ExtensionAPI) {
       stateConnection.reset();
       stateOther.reset();
       stateContinuation.endContinuation();
+      stateEmptyStop.endContinuation();
       // Signal to any in-flight triggerInvisibleContinue or pending retry
       // that the user has cancelled — do not queue another retry turn.
       _userAborted = true;
@@ -223,6 +234,7 @@ export default function (pi: ExtensionAPI) {
         stateConnection.succeed();
         stateOther.succeed();
         stateContinuation.complete();
+        stateEmptyStop.complete();
         // Clear abort flag — this is a fresh successful turn, so any
         // previous abort is stale and shouldn't block future retries.
         _userAborted = false;
@@ -275,6 +287,27 @@ export default function (pi: ExtensionAPI) {
       );
       void triggerInvisibleContinue("continue");
       stateContinuation.endContinuation();
+      return;
+    }
+
+    // Empty / think-only stop - the model ended its turn with NO usable
+    // output (zero text blocks, zero tool calls; only thinking or nothing).
+    // Anthropic documents these as "empty responses with end_turn" - the
+    // model decided the turn is complete. Not an error, but also not a
+    // usable turn: without this, the agent just goes silent.
+    //
+    // Remedy (per Anthropic docs and CLIProxyAPI 4886 measurements): one
+    // continuation prompt in a NEW user message. Bounded on purpose - a
+    // model that returns empty once tends to be done; see
+    // MAX_EMPTY_CONTINUATIONS below.
+    if (hasEmptyStop(lastAssistant) && !stateEmptyStop.getIsContinuing()) {
+      stateEmptyStop.startContinuation();
+      ctx.ui.notify(
+        `Empty response - nudging once to produce output (continuation ${stateEmptyStop.getCount()})...`,
+        "info",
+      );
+      void triggerInvisibleContinue("empty");
+      stateEmptyStop.endContinuation();
       return;
     }
 
@@ -382,6 +415,12 @@ export default function (pi: ExtensionAPI) {
         status += `  Is continuing: ${stateContinuation.getIsContinuing()}\n`;
         status += `  Trigger: hidden provider-valid AgentSession turn\n\n`;
 
+        // Empty-stop continuation state
+        status += "Empty/Think-only Stop Continuation:\n";
+        status += `  Continuations used: ${stateEmptyStop.getCount()}\n`;
+        status += `  Is continuing: ${stateEmptyStop.getIsContinuing()}\n`;
+        status += `  Cap: ${MAX_EMPTY_CONTINUATIONS} nudge(s), then give up\n\n`;
+
         // Config
         status += "Configuration:\n";
         status += `  Base delay: 2000ms\n`;
@@ -410,6 +449,7 @@ export default function (pi: ExtensionAPI) {
         stateConnection.reset();
         stateOther.reset();
         stateContinuation.reset();
+        stateEmptyStop.reset();
         _userAborted = false;
         ctx.ui.notify("All retry counters reset", "info");
         return;
@@ -432,6 +472,13 @@ export default function (pi: ExtensionAPI) {
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
         void triggerInvisibleContinue("continue");
+        return;
+      }
+
+      // Empty / think-only stop — nudge once
+      if (hasEmptyStop(lastAssistant)) {
+        ctx.ui.notify("Empty response — nudging once...", "info");
+        void triggerInvisibleContinue("empty");
         return;
       }
 
@@ -506,6 +553,7 @@ export default function (pi: ExtensionAPI) {
     stateConnection.reset();
     stateOther.reset();
     stateContinuation.reset();
+    stateEmptyStop.reset();
     // Do NOT reset _continueInProgress here — the in-flight loop's
     // finally block releases its owner token. Resetting it here could allow
     // a second loop to start before the old one has settled.
@@ -586,6 +634,9 @@ export default function (pi: ExtensionAPI) {
 
       let attempt = 0;
       let hiddenTurnKind: HiddenTurnKind | null = initialKind;
+      // Empty-stop nudges are bounded: MAX_EMPTY_CONTINUATIONS total
+      // continuation requests, then we give up (the model decided it is done).
+      let emptyNudges = 0;
 
       // Loop until success, abort, or session change.
       while (true) {
@@ -603,6 +654,20 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         removeErrorFromAgentState();
+
+        // Empty-stop cap: a model that produced no usable output and answers
+        // the nudge with another empty turn is decided, not stalled. Stop
+        // after MAX_EMPTY_CONTINUATIONS rather than looping forever.
+        if (hiddenTurnKind === "empty") {
+          if (emptyNudges >= MAX_EMPTY_CONTINUATIONS) {
+            _notifyFn?.(
+              `Empty response after ${emptyNudges} continuation(s) - giving up (model keeps ending the turn with no output).`,
+              "warning",
+            );
+            return;
+          }
+          emptyNudges++;
+        }
 
         attempt++;
         const delay = calculateDelay(attempt);
@@ -629,7 +694,9 @@ export default function (pi: ExtensionAPI) {
                 : CONTINUATION_CUSTOM_TYPE,
               content: hiddenTurnKind === "retry"
                 ? "Retry the previous request."
-                : "Continue exactly where you left off without repeating content.",
+                : hiddenTurnKind === "empty"
+                  ? "Your previous turn contained only thinking and no answer or text. Continue now and produce the actual response, using tools if needed."
+                  : "Continue exactly where you left off without repeating content.",
               display: false,
               details: undefined,
             },
