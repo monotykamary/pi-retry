@@ -157,8 +157,11 @@ const SILENCED_PATTERNS = [
 //     (Thinking). You can resume using this model at …" (Antigravity)
 // - OpenRouter:   "Rate limit exceeded: free-models-per-day. ..."
 // - Alibaba:      "Allocated quota exceeded, please increase your quota limit"
-//                 (Throttling.AllocationQuota — hard cap; RateQuota is
-//                 transient and stays retryable)
+//                 (429 Throttling.AllocationQuota / insufficient_quota) — TPM
+//                 token rate limiting, transient, auto-recovers in minutes;
+//                 stays retryable. Matched only when prefixed by a hard-cap
+//                 window: "hour|week|month allocated quota exceeded" (Coding
+//                 Plan) and "free allocated quota exceeded" (free quota drained)
 // - Copilot:      "You have exceeded your premium request allowance"
 // - LiteLLM:      "Budget has been exceeded! Current cost: …, Max budget: …"
 // - Kimi:         "Your account {org}<{ak}> is suspended, please check your
@@ -171,8 +174,9 @@ const SILENCED_PATTERNS = [
 //
 // Deliberately retryable (verified, kept out): DeepSeek 402 "Insufficient
 // Balance" and 429 "Rate Limit Reached" (concurrency), Kimi TPD org limits
-// and "exceeded your current token quota" (balance). See the note on
-// hasQuotaExhaustedError below.
+// and "exceeded your current token quota" (balance), Alibaba "Allocated quota
+// exceeded" (429 Throttling.AllocationQuota — TPM rate limiting, recovers in
+// minutes). See the note on hasQuotaExhaustedError below.
 export const QUOTA_EXHAUSTED_PATTERNS = [
   // Session / usage limits with reset windows (Claude, Codex, ChatGPT plans)
   /hit your (?:[a-z]+ )?usage limit/i, // "…hit your usage limit", "…hit your ChatGPT usage limit (plus plan)" — the optional word is the provider name; "hit your rate limit" intentionally NOT matched (burst limit stays retryable)
@@ -188,7 +192,14 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
   /exceeded your current quota/i, // Kimi's "...current token quota" (balance, retryable) intentionally not matched
   // Hard allotments
   /free.models.per.day/i, // OpenRouter free-tier daily pool
-  /allocated\s*quota/i, // Alibaba Throttling.AllocationQuota
+  // Alibaba: bare "Allocated quota exceeded" (429 Throttling.AllocationQuota /
+  // insufficient_quota) is TPM token rate limiting — transient, auto-recovers
+  // in minutes, retryable — NOT matched here. Only the Coding Plan window
+  // quotas (hour/week/month) and free-quota exhaustion are true hard caps.
+  /hour\s*allocated\s*quota/i, // "hour allocated quota exceeded" (Coding Plan)
+  /week\s*allocated\s*quota/i, // "week allocated quota exceeded" (Coding Plan)
+  /month\s*allocated\s*quota/i, // "month allocated quota exceeded" (Coding Plan)
+  /free\s*allocated\s*quota/i, // "free allocated quota exceeded" (free quota drained)
   /premium\s*request\s*allowance/i, // GitHub Copilot monthly allowance
   /monthly\s*(limit|quota|budget|allowance)/i,
   // Budget exhaustion (LiteLLM and similar proxies/gateways)
