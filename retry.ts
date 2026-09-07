@@ -16,6 +16,7 @@ import {
   isAssistantMessage,
   getLastAssistantMessage,
   calculateDelay,
+  loadPiRetryConfig,
   formatDuration,
   getErrorCategory,
   RetryState,
@@ -32,7 +33,8 @@ const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
  * Unified retry extension — retries EVERY error by default.
  *
  * Philosophy: any assistant message with stopReason === "error" is retried
- * indefinitely with exponential backoff, except a small blacklist of known
+ * with exponential backoff capped by settings, then stops after the configured
+ * number of failures at the maximum delay, except a small blacklist of known
  * permanent failures and hard-stop conditions (invalid API key, model not
  * found, quota/session-limit/budget exhaustion, suspended accounts, etc.).
  *
@@ -41,7 +43,7 @@ const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
  *
  * Features:
  * - Automatic detection and retry for ALL errors (catch-all)
- * - Indefinite retry with exponential backoff (capped at 60s)
+ * - Retry with exponential backoff and a configurable cap/failure limit
  * - Auto-continuation when model hits max output tokens (stopReason "length")
  * - Retry triggers are hidden in the TUI and serialized as provider-valid user turns
  * - Unified manual controls via /retry command
@@ -73,25 +75,15 @@ Agent.prototype.subscribe = function (this: Agent, ...args: any[]) {
   return _origSubscribe.apply(this, args);
 };
 
-// Monkey-patch AgentSession._prepareRetry to suppress the built-in retry
-// when pi-retry's loop is driving. Without this, both the built-in retry
-// and pi-retry race to handle the same error: the built-in retry counts
-// 3 failed attempts and shows "Retry failed after 3 attempts: ...",
-// while pi-retry is still looping indefinitely in the background.
-//
-// When _continueInProgress is true (pi-retry is running), _prepareRetry
-// returns false immediately, so _handlePostAgentRun falls through to
-// the compaction check and the while loop in _runAgentPrompt exits
-// cleanly. No auto_retry_start/end events, no "Retry failed" message.
-//
-// When _continueInProgress is false (pi-retry is not active), the
-// built-in retry works normally as a fallback.
+// AgentSession runs _prepareRetry inside _runAgentPrompt before it emits
+// agent_end. If native retry remains enabled, the first error is retried
+// before pi-retry can claim it, so the two retry loops interleave and produce
+// non-monotonic delays. pi-retry owns retry scheduling for the whole session;
+// returning false still lets AgentSession run its compaction check.
+let _piRetryActive = false;
 const _origPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 (AgentSession.prototype as any)._prepareRetry = function(this: any, message: any) {
-  if (
-    _continueInProgress &&
-    _continueInputGeneration === _inputGeneration
-  ) {
+  if (_piRetryActive) {
     return Promise.resolve(false);
   }
   return _origPrepareRetry.call(this, message);
@@ -197,6 +189,9 @@ function lastMessageIsRetryableError(): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Mark native retry as owned by this extension before the first agent turn.
+  _piRetryActive = true;
+  const retryConfig = loadPiRetryConfig();
 
   pi.on("input", () => {
     _inputGeneration++;
@@ -423,10 +418,11 @@ export default function (pi: ExtensionAPI) {
 
         // Config
         status += "Configuration:\n";
-        status += `  Base delay: 2000ms\n`;
-        status += `  Max delay: 60000ms\n`;
-        status += `  Backoff multiplier: 2\n`;
-        status += `  Retry loop: infinite (triggerInvisibleContinue loops until success or abort)\n\n`;
+        status += `  Base delay: ${retryConfig.baseDelayMs}ms\n`;
+        status += `  Max delay: ${retryConfig.maxDelayMs}ms\n`;
+        status += `  Backoff multiplier: ${retryConfig.multiplier}\n`;
+        status += `  Max-delay failures: ${retryConfig.maxRetriesAtMaxDelay}\n`;
+        status += "  Retry loop: until success, abort, or the max-delay failure limit\n\n";
 
         // Last assistant info
         if (lastAssistant && isAssistantMessage(lastAssistant)) {
@@ -634,9 +630,13 @@ export default function (pi: ExtensionAPI) {
 
       let attempt = 0;
       let hiddenTurnKind: HiddenTurnKind | null = initialKind;
-      // Empty-stop nudges are bounded: MAX_EMPTY_CONTINUATIONS total
-      // continuation requests, then we give up (the model decided it is done).
+      // Empty-stop nudges are bounded: a model that produced no usable output
+      // and answers the nudge with another empty turn is decided, not stalled.
+      // Stop after MAX_EMPTY_CONTINUATIONS rather than looping forever.
       let emptyNudges = 0;
+      // Only ordinary retries count toward the maximum-delay cutoff; token
+      // continuations intentionally remain uncapped.
+      let maxDelayRetries = 0;
 
       // Loop until success, abort, or session change.
       while (true) {
@@ -670,7 +670,11 @@ export default function (pi: ExtensionAPI) {
         }
 
         attempt++;
-        const delay = calculateDelay(attempt);
+        const delay = calculateDelay(attempt, retryConfig);
+        const isMaxDelay = delay >= retryConfig.maxDelayMs;
+        if (hiddenTurnKind === "retry" && isMaxDelay) {
+          maxDelayRetries++;
+        }
 
         // Notify the user about the upcoming retry attempt.
         _notifyRetryAttempt(attempt, delay);
@@ -678,7 +682,7 @@ export default function (pi: ExtensionAPI) {
         // Interruptible sleep with backoff BEFORE the retry attempt.
         // Polls _userAborted and _sessionGeneration every 100ms so ESC
         // and /new take effect within 100ms instead of waiting for the
-        // full backoff (up to 60s).
+        // full backoff (up to the configured maximum delay).
         const interrupted = await interruptibleSleep(
           delay,
           myGeneration,
@@ -725,6 +729,20 @@ export default function (pi: ExtensionAPI) {
         hiddenTurnKind = getHiddenTurnKind();
         if (!hiddenTurnKind) {
           didRetryComplete = true;
+          return;
+        }
+
+        // Stop ordinary retries after the configured number of failures at
+        // the cap. The failed capped turns have already been delivered; this
+        // check prevents scheduling one more capped request.
+        if (
+          hiddenTurnKind === "retry" &&
+          maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
+        ) {
+          _notifyFn?.(
+            `Retry failed ${retryConfig.maxRetriesAtMaxDelay} times at the maximum backoff (${formatDuration(retryConfig.maxDelayMs)}); giving up.`,
+            "warning",
+          );
           return;
         }
       }

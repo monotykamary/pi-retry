@@ -21,11 +21,11 @@ This extension automatically detects and retries **all** errors by default, with
 
 | Error Type | Retry Behavior | Use Case |
 |------------|----------------|----------|
-| **Any retryable error** (catch-all) | **Indefinite** with capped backoff | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
-| HTTP 400/413 | **Indefinite** with capped backoff, NO compaction | Transient context overflow that might resolve |
-| Credit / payment errors | **Indefinite** with capped backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
+| **Any retryable error** (catch-all) | **Capped exponential retry** | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
+| HTTP 400/413 | **Capped** with exponential backoff, NO compaction | Transient context overflow that might resolve |
+| Credit / payment errors | **Capped** with exponential backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
 | **Quota / session-limit / budget exhaustion** | **Not retried** — notify + stop | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
-| Connection errors | **Indefinite** with capped backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
+| Connection errors | **Capped** with exponential backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
 | Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
 | Empty / think-only stop (`stopReason: "stop"` with no text or tool calls) | **Nudge once** with a hidden continuation, then give up | Model ends its turn with no usable output (Anthropic empty responses with end_turn, thinking-only turns) |
 
@@ -43,7 +43,7 @@ By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded)
 
 ## The Solution
 
-This extension provides **automatic** infinite retry with sensible exponential backoff (2s → 4s → 8s → ... → 60s max).
+This extension provides automatic retry for all errors with configurable exponential backoff and a maximum-delay failure limit (2s → 4s → 8s → ... → 60s by default).
 
 **Philosophy: retry EVERYTHING by default.** The only things we skip are a tiny blacklist of known permanent failures (invalid API key, model not found, unsupported model, etc.).
 
@@ -51,9 +51,9 @@ This extension provides **automatic** infinite retry with sensible exponential b
 - **Catch-all retry** — Any `stopReason: "error"` is retried, regardless of error message
 - Automatic detection of 400/413, connection, credit, and stream exhaustion errors
 - **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, hidden from the TUI
-- **Indefinite retry** — Keeps retrying until success
+- **Retry cutoff** — Keeps retrying until success, abort, or the configured number of failures at the maximum delay
 - **Auto-stop on quota/budget exhaustion** — Session limits, plan quotas, and budget caps ("You've hit your limit", "out of budget", `insufficient_quota`, suspended accounts) are detected and **not** retried, with a notification explaining why
-- Exponential backoff with cap: max 60s between retries
+- Exponential backoff with configurable base delay, cap, multiplier, and maximum-delay failure count
 - **Hidden triggers** — provider-valid custom messages use `display: false`, so retries do not add TUI clutter
 - Manual controls via unified `/retry` command
 - Non-retryable errors are explicitly logged so you know why we didn't retry
@@ -121,14 +121,34 @@ Once loaded, the extension **automatically** detects and retries all errors.
 
 ## Configuration
 
-Edit the constants at the top of `retry.ts`:
+The extension reads a `piRetry` object from Pi's settings files:
 
-```typescript
-const BASE_DELAY_MS = 2000;        // Start with 2 seconds
-const MAX_DELAY_MS = 60000;        // Cap at 60 seconds
-const BACKOFF_MULTIPLIER = 2;      // Double each time
-// Continuations use a hidden provider-valid custom message
+- `~/.pi/agent/settings.json` applies globally.
+- `.pi/settings.json` overrides matching global values for the current project.
+
+```json
+{
+  "piRetry": {
+    "baseDelayMs": 10000,
+    "maxDelayMs": 3600000,
+    "multiplier": 2,
+    "maxRetriesAtMaxDelay": 3
+  }
+}
 ```
+
+The example above waits 10 seconds before the first retry, doubles each delay, caps the delay at one hour, and stops after three failed retries at that cap. Supported values are:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `baseDelayMs` | `2000` | Delay before the first retry, in milliseconds |
+| `maxDelayMs` | `60000` | Maximum delay between retries, in milliseconds |
+| `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
+| `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
+
+`piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
+
+Settings are read when the extension starts. Restart pi or use `/reload` after editing them.
 
 ---
 
@@ -234,11 +254,13 @@ npm run lint:dead
 .
 ├── retry.ts                   # Main unified extension
 ├── src/                       # Shared utilities (testable, DRY)
+│   ├── config.ts             # Settings-backed retry configuration
 │   ├── error-patterns.ts      # Error pattern matching, custom types, hasMaxTokensStop
 │   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, ContinuationState, etc.)
 │   └── index.ts               # Barrel exports
 ├── __tests__/                 # Unit tests
 │   └── unit/
+│       ├── config.test.ts
 │       ├── error-patterns.test.ts
 │       └── retry-logic.test.ts
 ├── vitest.config.ts           # Test configuration
@@ -249,7 +271,7 @@ npm run lint:dead
 
 ```bash
 # Run all quality checks
-npm test              # 99 unit tests
+npm test              # 224 tests
 npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```
@@ -302,7 +324,7 @@ pi install npm:@georgebashi/pi-retry
 
 ## Limitations
 
-- Extensions cannot override pi's internal `isRetryableError()` check — they run *after* pi decides not to auto-retry
+- Pi's native retry scheduler is disabled while this extension is loaded so native and extension retries cannot interleave; Pi's compaction check still runs normally
 - Error messages remain in the session history (but are invisible to the LLM)
 - May hit the same error repeatedly if the issue is persistent (use `Ctrl+C` to abort)
 - **Warning**: Retrying 400/413 without reducing context may fail repeatedly if the payload is genuinely too large

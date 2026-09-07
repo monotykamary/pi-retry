@@ -69,8 +69,10 @@ async function setup() {
   vi.resetModules();
 
   const { Agent } = await import("@earendil-works/pi-agent-core");
+  const { AgentSession } = await import("@earendil-works/pi-coding-agent");
   const origSubscribe = Agent.prototype.subscribe;
   const origContinue = Agent.prototype.continue;
+  const origPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
   const mod = await import("../../retry.ts");
   const factory = mod.default;
@@ -86,6 +88,8 @@ async function setup() {
     restore: () => {
       Agent.prototype.subscribe = origSubscribe;
       Agent.prototype.continue = origContinue;
+      // Restore the shared prototype so later tests start from Pi's native behavior.
+      (AgentSession.prototype as any)._prepareRetry = origPrepareRetry;
       activeMockAgent = undefined;
     },
   };
@@ -506,6 +510,40 @@ describe("smoke: built-in retry exhaustion", () => {
   });
 });
 
+describe("smoke: retry delay cutoff", () => {
+  it("stops after three failed retries at the maximum delay", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          // Keep returning the same failure so the retry cutoff is exercised.
+          agent.state.messages = [
+            { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+          ];
+          return Promise.resolve();
+        }),
+      );
+      const ctx = createMockCtx([errorEntry("Connection error")]);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      // Default delays: 2s, 4s, 8s, 16s, 32s, then three 60s attempts.
+      await advance(250_000);
+
+      expect(agent.prompt).toHaveBeenCalledTimes(8);
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("Retry failed 3 times at the maximum backoff"),
+        "warning",
+      );
+    } finally {
+      restore();
+    }
+  });
+});
+
 // ── Edge case: max_tokens continuation ──
 
 describe("smoke: max_tokens continuation", () => {
@@ -715,46 +753,14 @@ describe("smoke: /retry command", () => {
 // ── Critical: built-in retry suppression ──
 
 describe("smoke: built-in retry suppression", () => {
-  it("_prepareRetry returns false when _continueInProgress is true", async () => {
-    const { handlers, restore } = await setup();
+  it("_prepareRetry returns false while pi-retry is active", async () => {
+    const { restore } = await setup();
     try {
-      // Fire an error to start pi-retry's loop. This sets _continueInProgress = true
-      // synchronously (before the first await in triggerInvisibleContinue).
-      let attempt = 0;
-      const agent = await createAgentWithMessages(
-        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
-        vi.fn().mockImplementation(() => {
-          attempt++;
-          if (attempt >= 2) {
-            agent.state.messages = [
-              { role: "assistant", stopReason: "stop", content: [] },
-            ];
-          } else {
-            agent.state.messages = [
-              { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
-            ];
-          }
-          return Promise.resolve();
-        })
-      );
+      const { AgentSession } = await import("@earendil-works/pi-coding-agent");
+      const prepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
-      const entries = [errorEntry("Connection error")];
-      const ctx = createMockCtx(entries);
-
-      const fns = handlers["agent_end"] ?? [];
-      for (const fn of fns) {
-        void fn({ messages: [] }, ctx);
-      }
-
-      // Advance through pi-retry's backoff + prompt cycles
-      await advance(10000);
-
-      // The key assertion: ctx.ui.notify should NOT have been called
-      // with "Retry failed after" — that message comes from the built-in
-      // retry's auto_retry_end event, which should be suppressed.
-      const notifyCalls = ctx.ui.notify.mock.calls.map((c: any) => c[0]);
-      const failureCalls = notifyCalls.filter((c: string) => c.includes("Retry failed after"));
-      expect(failureCalls.length).toBe(0);
+      // Native retry must be disabled before agent_end can start pi-retry's loop.
+      await expect(prepareRetry.call({}, {})).resolves.toBe(false);
     } finally {
       restore();
     }
@@ -765,12 +771,10 @@ describe("smoke: built-in retry suppression", () => {
     try {
       const { AgentSession } = await import("@earendil-works/pi-coding-agent");
 
-      // Verify the monkey-patch is installed
-      expect(typeof (AgentSession.prototype as any)._prepareRetry).toBe("function");
-
-      // When _continueInProgress is true, it returns false immediately
-      // (We can't easily set _continueInProgress directly since it's module-scoped,
-      // but we verified the source code in the race-condition test.)
+      // Verify the monkey-patch is installed and returns the native retry guard.
+      const prepareRetry = (AgentSession.prototype as any)._prepareRetry;
+      expect(typeof prepareRetry).toBe("function");
+      await expect(prepareRetry.call({}, {})).resolves.toBe(false);
     } finally {
       restore();
     }
