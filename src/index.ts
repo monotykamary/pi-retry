@@ -6,5 +6,6 @@
  * - Retry logic (exponential backoff, state management)
  */
 
+export * from './config.js';
 export * from './error-patterns.js';
 export * from './retry-logic.js';
