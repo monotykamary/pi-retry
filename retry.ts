@@ -162,20 +162,20 @@ function interruptibleSleep(
 // Same technique used by the built-in retry in _prepareRetry — the error
 // message stays in the session journal for history but is removed from the
 // agent's live transcript so the LLM receives a clean context on retry.
-function removeErrorFromAgentState(): void {
-  if (!_agent) return;
-  const messages = _agent.state.messages;
+function removeErrorFromAgentState(agent: Agent | null = _agent): void {
+  if (!agent) return;
+  const messages = agent.state.messages;
   const lastMsg = messages[messages.length - 1];
   if (lastMsg?.role === 'assistant' && lastMsg.stopReason === 'error') {
-    _agent.state.messages = messages.slice(0, -1);
+    agent.state.messages = messages.slice(0, -1);
   }
 }
 
 type HiddenTurnKind = "retry" | "continue" | "empty";
 
-function getHiddenTurnKind(): HiddenTurnKind | null {
-  if (!_agent) return null;
-  const messages = _agent.state.messages;
+function getHiddenTurnKind(agent: Agent | null = _agent): HiddenTurnKind | null {
+  if (!agent) return null;
+  const messages = agent.state.messages;
   const lastMsg = messages[messages.length - 1];
   if (lastMsg?.role !== "assistant") return null;
   if (lastMsg.stopReason === "error") return "retry";
@@ -189,6 +189,8 @@ function lastMessageIsRetryableError(): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
+  let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
+
   // Mark native retry as owned by this extension before the first agent turn.
   _piRetryActive = true;
   const retryConfig = loadPiRetryConfig();
@@ -537,6 +539,21 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // Handle session replacement before Pi invalidates this extension runtime.
+  // A retry loop may still be awaiting a timer or AgentSession turn when the
+  // old session shuts down, so release its ownership and invalidate its
+  // generation before the captured pi object becomes stale.
+  pi.on("session_shutdown", () => {
+    _sessionGeneration++;
+    _userAborted = true;
+    _continueInProgress = false;
+    _continueGeneration = null;
+    _continueInputGeneration = null;
+    _notifyFn = null;
+    _terminalInputUnsubscribe?.();
+    _terminalInputUnsubscribe = null;
+  });
+
   // Initialize
   pi.on("session_start", async (_event, ctx) => {
     // Bump the generation counter so any in-flight retry loop from a
@@ -554,6 +571,7 @@ export default function (pi: ExtensionAPI) {
     // finally block releases its owner token. Resetting it here could allow
     // a second loop to start before the old one has settled.
     _userAborted = false;
+    _notifyFn = null;
 
     _terminalInputUnsubscribe?.();
     _terminalInputUnsubscribe = null;
@@ -596,7 +614,10 @@ export default function (pi: ExtensionAPI) {
   // agent.state.messages so the LLM receives a clean context (same
   // technique as the built-in retry's _prepareRetry).
   async function triggerInvisibleContinue(initialKind: HiddenTurnKind) {
-    if (!_agent) return;
+    // Keep the AgentSession that started this loop. A replacement session can
+    // update the module-level reference before an old loop has unwound.
+    const myAgent = _agent;
+    if (!myAgent) return;
 
     // Guard: if the user aborted, do not queue another retry turn.
     if (_userAborted) return;
@@ -606,7 +627,6 @@ export default function (pi: ExtensionAPI) {
     _continueInProgress = true;
     const retryLifecycleId = ++_retryLifecycleId;
     let didRetryComplete = false;
-    pi.events.emit(RETRY_STARTED_EVENT, { retryId: retryLifecycleId });
 
     // Capture the current session generation. If /new fires while we're
     // looping, _sessionGeneration will increment and the loop will exit.
@@ -616,9 +636,11 @@ export default function (pi: ExtensionAPI) {
     _continueInputGeneration = myInputGeneration;
 
     try {
+      emitRetryLifecycleEvent(RETRY_STARTED_EVENT, retryLifecycleId);
+
       // Wait for the current run to finish (activeRun resolves in
       // finishRun() after agent_end listeners return).
-      await _agent.waitForIdle();
+      await myAgent.waitForIdle();
 
       // Re-check after waitForIdle: the user may have aborted or the
       // session may have changed while we were waiting.
@@ -653,14 +675,14 @@ export default function (pi: ExtensionAPI) {
           didRetryComplete = true;
           return;
         }
-        removeErrorFromAgentState();
+        removeErrorFromAgentState(myAgent);
 
         // Empty-stop cap: a model that produced no usable output and answers
         // the nudge with another empty turn is decided, not stalled. Stop
         // after MAX_EMPTY_CONTINUATIONS rather than looping forever.
         if (hiddenTurnKind === "empty") {
           if (emptyNudges >= MAX_EMPTY_CONTINUATIONS) {
-            _notifyFn?.(
+            notifySafely(
               `Empty response after ${emptyNudges} continuation(s) - giving up (model keeps ending the turn with no output).`,
               "warning",
             );
@@ -711,7 +733,7 @@ export default function (pi: ExtensionAPI) {
           // low-level run synchronously before returning. Waiting on Agent
           // keeps this retry loop intact without bypassing session state.
           await Promise.resolve();
-          await _agent.waitForIdle();
+          await myAgent.waitForIdle();
         } catch {
           return;
         }
@@ -726,7 +748,7 @@ export default function (pi: ExtensionAPI) {
 
         // The hidden AgentSession turn completed. Both errors and output
         // length stops need another turn; all other terminal states are done.
-        hiddenTurnKind = getHiddenTurnKind();
+        hiddenTurnKind = getHiddenTurnKind(myAgent);
         if (!hiddenTurnKind) {
           didRetryComplete = true;
           return;
@@ -739,7 +761,7 @@ export default function (pi: ExtensionAPI) {
           hiddenTurnKind === "retry" &&
           maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
         ) {
-          _notifyFn?.(
+          notifySafely(
             `Retry failed ${retryConfig.maxRetriesAtMaxDelay} times at the maximum backoff (${formatDuration(retryConfig.maxDelayMs)}); giving up.`,
             "warning",
           );
@@ -747,14 +769,20 @@ export default function (pi: ExtensionAPI) {
         }
       }
     } finally {
-      // Release the mutex only if this loop still owns it.
+      // Release the mutex only if this loop still owns it. If the session was
+      // replaced, session_shutdown clears ownership and suppresses the event
+      // because the captured pi.events bus is stale by this point.
       if (_continueGeneration === myGeneration) {
-        pi.events.emit(didRetryComplete ? RETRY_COMPLETED_EVENT : RETRY_CANCELLED_EVENT, {
-          retryId: retryLifecycleId,
-        });
+        const sessionIsCurrent = _sessionGeneration === myGeneration;
         _continueInProgress = false;
         _continueGeneration = null;
         _continueInputGeneration = null;
+        if (sessionIsCurrent) {
+          emitRetryLifecycleEvent(
+            didRetryComplete ? RETRY_COMPLETED_EVENT : RETRY_CANCELLED_EVENT,
+            retryLifecycleId,
+          );
+        }
       }
     }
   }
@@ -763,7 +791,34 @@ export default function (pi: ExtensionAPI) {
   // ctx.ui.notify is only available inside event handlers, not inside
   // triggerInvisibleContinue. We capture a fresh reference from the
   // most recent handler invocation so it's always current.
-  let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
+
+  function isStaleContextError(error: unknown): boolean {
+    return error instanceof Error && error.message.includes("This extension ctx is stale");
+  }
+
+  function emitRetryLifecycleEvent(event: string, retryId: number): void {
+    try {
+      pi.events.emit(event, { retryId });
+    } catch (error) {
+      // Session replacement invalidates the old event bus while a retry loop
+      // can still be unwinding. There is no live listener to notify then.
+      if (!isStaleContextError(error)) throw error;
+    }
+  }
+
+  function notifySafely(message: string, level: "info" | "warning" | "error"): void {
+    if (!_notifyFn) return;
+    try {
+      _notifyFn(message, level);
+    } catch (error) {
+      // The notification closure can outlive the session that supplied its ctx.
+      if (isStaleContextError(error)) {
+        _notifyFn = null;
+        return;
+      }
+      throw error;
+    }
+  }
 
   // Refresh on every handler that carries a ctx — stale references
   // break after session switches (the old ctx becomes invalid).
@@ -778,9 +833,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   function _notifyRetryAttempt(attempt: number, delayMs: number) {
-    if (_notifyFn) {
-      const duration = formatDuration(delayMs);
-      _notifyFn(`Retry attempt ${attempt} (backoff ${duration})...`, "info");
-    }
+    const duration = formatDuration(delayMs);
+    notifySafely(`Retry attempt ${attempt} (backoff ${duration})...`, "info");
   }
 }

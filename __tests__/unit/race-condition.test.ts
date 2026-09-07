@@ -128,6 +128,7 @@ async function setup(agentOverrides?: Parameters<typeof createMockAgent>[0]) {
   Agent.prototype.subscribe.call(agent, vi.fn());
 
   return {
+    api,
     handlers,
     commands,
     agent,
@@ -170,6 +171,65 @@ describe("triggerInvisibleContinue retry loop", () => {
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not use the stale event bus after session shutdown", async () => {
+    const { api, handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockResolvedValue(undefined),
+    });
+    try {
+      fireAgentEndAsync(handlers, [errorEntry("Connection error")]);
+      expect(api.events.emit).toHaveBeenCalledWith(
+        "pi-retry:started",
+        { retryId: 1 },
+      );
+
+      const staleError = new Error(
+        "This extension ctx is stale after session replacement or reload.",
+      );
+      const emit = api.events.emit as any;
+      emit.mockImplementation(() => {
+        throw staleError;
+      });
+
+      // Pi emits session_shutdown before invalidating the old extension runtime.
+      for (const handler of handlers["session_shutdown"] ?? []) {
+        await handler({}, createMockCtx());
+      }
+
+      // The old loop should stop during backoff without sending or emitting
+      // through the invalidated extension context.
+      await advanceThroughRetry(3000);
+
+      expect(agent.prompt).not.toHaveBeenCalled();
+      expect(emit).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("contains a stale lifecycle emit if invalidation races the loop", async () => {
+    const { api, handlers, agent, restore } = await setup({
+      prompt: vi.fn().mockResolvedValue(undefined),
+    });
+    try {
+      fireAgentEndAsync(handlers, [errorEntry("Connection error")]);
+      const staleError = new Error(
+        "This extension ctx is stale after session replacement or reload.",
+      );
+      const emit = api.events.emit as any;
+      emit.mockImplementation(() => {
+        throw staleError;
+      });
+
+      // This models a runtime invalidation arriving after the loop started but
+      // without a lifecycle callback reaching the extension instance.
+      await advanceThroughRetry(3000);
+
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       restore();
     }
