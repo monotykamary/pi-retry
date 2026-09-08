@@ -146,9 +146,45 @@ The example above waits 10 seconds before the first retry, doubles each delay, c
 | `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
 | `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
 
-`piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
+`piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. For an ordinary session, the extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
 
-Settings are read when the extension starts. Restart pi or use `/reload` after editing them.
+### Child sessions
+
+Native `pi-subagents` children use the generated standalone `<active_agent name="..."/>` marker in their effective system prompt. A child that loaded this extension inherits the effective main `piRetry` policy unless `piRetry.subagents` supplies overrides. This marker is a compatibility convention, not a security boundary: placing the same standalone tag in an ordinary session's system prompt or loaded context can also select the child policy.
+
+```json
+{
+  "piRetry": {
+    "baseDelayMs": 2000,
+    "maxDelayMs": 60000,
+    "multiplier": 2,
+    "maxRetriesAtMaxDelay": 3,
+    "subagents": {
+      "baseDelayMs": 500,
+      "maxRetriesAtMaxDelay": 5
+    }
+  }
+}
+```
+
+`subagents` must be an object. Its numeric fields merge project over global settings and then fall back field-by-field to the effective main policy. The child policy is enabled by default when the object is absent; only `{ "enabled": false }` delegates that recognized child to Pi's native retry scheduler. Boolean shorthand such as `"subagents": false` and a top-level `piRetry.enabled` field are unsupported and do not disable child takeover. Invalid fields are warned about and fall back to their inherited values.
+
+Child takeover is available only when this extension is registered in that child session. Installing pi-retry globally or loading it in the parent does not guarantee that a foreground child loads it: foreground children do not inherit ambient extensions. Configure the agent used by the child explicitly, for example:
+
+```yaml
+---
+name: worker
+extensions:
+  - /absolute/path/to/retry.ts
+# Or load it only in child sessions:
+subagentOnlyExtensions:
+  - /absolute/path/to/retry.ts
+---
+```
+
+Use the corresponding `extensions`/`subagentOnlyExtensions` fields in the `pi-subagents` agent definition for the foreground or background launch. Background extension resolution may include ambient extensions when `extensions` is omitted, but explicit paths are the portable choice. pi-retry's child lifecycle adapter targets the private `AgentSession.bindExtensions`/`_prepareRetry` seam available in SDK 0.85.1. If a future SDK does not expose that seam, pi-retry leaves native retry behavior unchanged rather than taking over without a session identity.
+
+Main-session settings are refreshed at session startup and before each new agent prompt. An existing child controller retains its numeric backoff policy; start a new child to apply changed numeric values. Restart pi or use `/reload` to recreate extension state consistently.
 
 ---
 
@@ -162,7 +198,7 @@ Settings are read when the extension starts. Restart pi or use `/reload` after e
 6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
 7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
 8. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
-8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
+9. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`. For child sessions, completion can mark a recovered model turn that proceeds to tools; it does not mean the entire child task has finished. Hosts must use the session prompt/lifecycle contract for task completion.
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
 
@@ -254,15 +290,20 @@ npm run lint:dead
 .
 ├── retry.ts                   # Main unified extension
 ├── src/                       # Shared utilities (testable, DRY)
+│   ├── child-retry.ts         # Inline retry lifecycle for recognized child sessions
+│   ├── session-registry.ts    # Shared SDK session identity and native-retry hook
 │   ├── config.ts             # Settings-backed retry configuration
 │   ├── error-patterns.ts      # Error pattern matching, custom types, hasMaxTokensStop
 │   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, ContinuationState, etc.)
 │   └── index.ts               # Barrel exports
-├── __tests__/                 # Unit tests
-│   └── unit/
-│       ├── config.test.ts
-│       ├── error-patterns.test.ts
-│       └── retry-logic.test.ts
+├── __tests__/
+│   ├── unit/
+│   │   ├── config.test.ts
+│   │   ├── error-patterns.test.ts
+│   │   ├── retry-logic.test.ts
+│   │   └── session-registry.test.ts
+│   └── integration/
+│       └── native-child-lifecycle.test.ts
 ├── vitest.config.ts           # Test configuration
 └── knip.json                  # Dead code detection config
 ```
@@ -271,7 +312,7 @@ npm run lint:dead
 
 ```bash
 # Run all quality checks
-npm test              # 224 tests
+npm test              # 249 tests
 npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```

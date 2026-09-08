@@ -10,6 +10,7 @@ import {
   DEFAULT_RETRY_CONFIG,
   loadPiRetryConfig,
   resolvePiRetryConfig,
+  resolvePiRetrySettings,
 } from "../../src/config.js";
 
 const temporaryRoots: string[] = [];
@@ -55,6 +56,126 @@ function writeSettings(
   writeFileSync(filePath, JSON.stringify(settings), "utf8");
 }
 
+describe("resolvePiRetrySettings", () => {
+  // Absent child settings inherit the already effective main policy.
+  it("inherits the effective main policy when subagents is absent", () => {
+    const settings = resolvePiRetrySettings(
+      { piRetry: { baseDelayMs: 25, maxDelayMs: 500, multiplier: 1.5 } },
+      { piRetry: { multiplier: 2 } },
+    );
+
+    expect(settings.main).toEqual({
+      baseDelayMs: 25,
+      maxDelayMs: 500,
+      multiplier: 2,
+      maxRetriesAtMaxDelay: 3,
+    });
+    expect(settings.subagents).toEqual({
+      enabled: true,
+      ...settings.main,
+    });
+  });
+
+  // Nested project fields merge over nested global fields, then main values.
+  it("merges nested project fields over global and main settings", () => {
+    const settings = resolvePiRetrySettings(
+      {
+        piRetry: {
+          baseDelayMs: 10,
+          maxDelayMs: 100,
+          multiplier: 2,
+          subagents: { baseDelayMs: 3, multiplier: 1.25 },
+        },
+      },
+      {
+        piRetry: {
+          maxDelayMs: 200,
+          maxRetriesAtMaxDelay: 7,
+          subagents: { maxDelayMs: 33 },
+        },
+      },
+    );
+
+    expect(settings.main).toEqual({
+      baseDelayMs: 10,
+      maxDelayMs: 200,
+      multiplier: 2,
+      maxRetriesAtMaxDelay: 7,
+    });
+    expect(settings.subagents).toEqual({
+      enabled: true,
+      baseDelayMs: 3,
+      maxDelayMs: 33,
+      multiplier: 1.25,
+      maxRetriesAtMaxDelay: 7,
+    });
+  });
+
+  // Every invalid child field falls back independently to main policy values.
+  it("falls back per child field when nested values are invalid", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const settings = resolvePiRetrySettings(
+      {},
+      {
+        piRetry: {
+          subagents: {
+            enabled: "yes",
+            baseDelayMs: -1,
+            maxDelayMs: "large",
+            multiplier: 0,
+            maxRetriesAtMaxDelay: 1.5,
+          },
+        },
+      },
+    );
+
+    expect(settings.subagents).toEqual({
+      enabled: true,
+      ...DEFAULT_RETRY_CONFIG,
+    });
+    expect(warning).toHaveBeenCalledTimes(5);
+  });
+
+  // Boolean shorthand is invalid; only an object with enabled:false disables.
+  it("accepts enabled:false but ignores boolean shorthand", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const disabled = resolvePiRetrySettings({}, {
+      piRetry: { subagents: { enabled: false } },
+    });
+    const shorthand = resolvePiRetrySettings({}, {
+      piRetry: { subagents: false },
+    });
+
+    expect(disabled.subagents.enabled).toBe(false);
+    expect(shorthand.subagents).toEqual({
+      enabled: true,
+      ...DEFAULT_RETRY_CONFIG,
+    });
+    expect(warning).toHaveBeenCalledOnce();
+  });
+
+  // An invalid project namespace cannot erase a valid global child policy.
+  it("warns and retains the valid global namespace when project is invalid", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const settings = resolvePiRetrySettings(
+      { piRetry: { subagents: { baseDelayMs: 11 } } },
+      { piRetry: { subagents: ["invalid"] } },
+    );
+
+    expect(settings.subagents.baseDelayMs).toBe(11);
+    expect(settings.subagents.enabled).toBe(true);
+    expect(warning).toHaveBeenCalledOnce();
+  });
+
+  // The unsupported top-level enabled field must not disable child takeover.
+  it("does not treat top-level enabled as the child switch", () => {
+    const settings = resolvePiRetrySettings({}, {
+      piRetry: { enabled: false },
+    });
+
+    expect(settings.subagents.enabled).toBe(true);
+  });
+});
 describe("resolvePiRetryConfig", () => {
   it("preserves defaults when no piRetry namespace is present", () => {
     expect(resolvePiRetryConfig({}, {})).toEqual(DEFAULT_RETRY_CONFIG);
