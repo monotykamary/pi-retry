@@ -57,6 +57,10 @@ interface ChildHarnessOptions {
   childRetryEnabled?: boolean;
   /** Whether the generated child marker is present. */
   childMarker?: boolean;
+  /** Explicit policy-selection regex list; null omits the match setting. */
+  matchSystemPromptRegex?: unknown | null;
+  /** Effective system-prompt text appended to this session. */
+  systemPrompt?: string;
   /** Whether this harness loads retry.ts into the extension runner. */
   loadRetryExtension?: boolean;
   /** Provider context window used to exercise SDK compaction decisions. */
@@ -106,14 +110,23 @@ async function createChildHarness(
       ? {}
       : { enabled: options.childRetryEnabled }),
   };
+  const configuredMatch = options.matchSystemPromptRegex === undefined
+    ? options.childMarker === false
+      ? undefined
+      : [{ pattern: '^<active_agent name="[^"\\r\\n]+"/>$', flags: "m" }]
+    : options.matchSystemPromptRegex;
+  const subagents = {
+    ...childRetryConfig,
+    ...(configuredMatch === undefined || configuredMatch === null
+      ? {}
+      : { match: { systemPromptRegex: configuredMatch } }),
+  };
   const piRetry = {
     baseDelayMs,
     maxDelayMs: baseDelayMs,
     multiplier: 1,
     maxRetriesAtMaxDelay: 2,
-    ...(Object.keys(childRetryConfig).length > 0
-      ? { subagents: childRetryConfig }
-      : {}),
+    ...(Object.keys(subagents).length > 0 ? { subagents } : {}),
   };
   writeFileSync(
     join(root, ".pi", "settings.json"),
@@ -182,10 +195,14 @@ async function createChildHarness(
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    // This is the launch marker emitted by pi-subagents for native children.
-    appendSystemPrompt: options.childMarker === false
-      ? []
-      : ['<active_agent name="worker"/>'],
+    // This is the launch marker emitted by pi-subagents. The test fixture
+    // explicitly configures a matching policy rule instead of relying on it
+    // as an implicit production default.
+    appendSystemPrompt: options.systemPrompt === undefined
+      ? options.childMarker === false
+        ? []
+        : ['<active_agent name="worker"/>']
+      : [options.systemPrompt],
     extensionFactories: [...retryFactories, ...extraFactories],
   });
 
@@ -342,6 +359,160 @@ describe("native child retry lifecycle", () => {
       expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(0);
     } finally {
       await harness.close();
+    }
+  });
+
+  // User-configured OR rules, arbitrary markers, and flags select inline recovery.
+  it("selects inline recovery from an arbitrary configured system prompt rule", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("configured child failed", {
+          stopReason: "error",
+          errorMessage: "deterministic configured-child connection error",
+        }),
+        fauxAssistantMessage("configured child recovered"),
+      ],
+      30,
+      {
+        nativeRetryEnabled: true,
+        childMarker: false,
+        systemPrompt: '<worker_profile mode="retry"/>',
+        matchSystemPromptRegex: [
+          { pattern: "<never-selected>", flags: "i" },
+          { pattern: '^<WORKER_PROFILE MODE="RETRY"/>$', flags: "im" },
+        ],
+      },
+    );
+    try {
+      let promptSettled = false;
+      const promptPromise = harness.session.prompt("Recover the configured child.").then(() => {
+        promptSettled = true;
+      });
+
+      await harness.waitForFirstErrorBackoff();
+      expect(promptSettled).toBe(false);
+      expect(harness.session.isStreaming).toBe(true);
+
+      await promptPromise;
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // An old third-party marker has no meaning when the user omits match rules.
+  it("keeps the ordinary extension route when the old marker has no rule", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("ordinary route failed", {
+          stopReason: "error",
+          errorMessage: "deterministic ordinary-route connection error",
+        }),
+        fauxAssistantMessage("ordinary route recovered"),
+      ],
+      0,
+      { nativeRetryEnabled: true, matchSystemPromptRegex: null },
+    );
+    try {
+      // The ordinary route intentionally detaches its hidden retry, so the
+      // host prompt can settle before the follow-up request is delivered.
+      const promptPromise = harness.session.prompt("Use ordinary pi-retry handling.");
+      await harness.waitForFirstErrorBackoff();
+      await promptPromise;
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // Invalid syntax produces no child selection and cannot fall back to a broad rule.
+  it("keeps ordinary handling when the configured matcher is malformed", async () => {
+    const harness = await createChildHarness(
+      [
+        fauxAssistantMessage("malformed matcher failed", {
+          stopReason: "error",
+          errorMessage: "deterministic malformed-matcher connection error",
+        }),
+        fauxAssistantMessage("malformed matcher recovered"),
+      ],
+      0,
+      {
+        nativeRetryEnabled: true,
+        matchSystemPromptRegex: [{ pattern: "[" }],
+      },
+    );
+    try {
+      const promptPromise = harness.session.prompt("Use ordinary handling after invalid configuration.");
+      await harness.waitForFirstErrorBackoff();
+      await promptPromise;
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+      expect(harness.faux.state.callCount).toBe(2);
+      expect(harness.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  // A matcher result from one session must not classify a later session.
+  it("does not leak matcher state across sessions", async () => {
+    const matchSystemPromptRegex = [
+      { pattern: "^<worker-profile/>$", flags: "m" },
+    ];
+    const matched = await createChildHarness(
+      [
+        fauxAssistantMessage("matched session failed", {
+          stopReason: "error",
+          errorMessage: "deterministic matched-session connection error",
+        }),
+        fauxAssistantMessage("matched session recovered"),
+      ],
+      0,
+      {
+        nativeRetryEnabled: true,
+        childMarker: false,
+        systemPrompt: "<worker-profile/>",
+        matchSystemPromptRegex,
+      },
+    );
+    try {
+      await matched.session.prompt("Use the selected inline policy.");
+      expect(matched.faux.state.callCount).toBe(2);
+      expect(matched.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+    } finally {
+      await matched.close();
+    }
+
+    const ordinary = await createChildHarness(
+      [
+        fauxAssistantMessage("ordinary session failed", {
+          stopReason: "error",
+          errorMessage: "deterministic ordinary-session connection error",
+        }),
+        fauxAssistantMessage("ordinary session recovered"),
+      ],
+      0,
+      {
+        nativeRetryEnabled: true,
+        systemPrompt: '<active_agent name="worker"/>',
+        matchSystemPromptRegex,
+      },
+    );
+    try {
+      // The old marker is intentionally present but does not match the rule.
+      const promptPromise = ordinary.session.prompt("Use ordinary handling.");
+      await ordinary.waitForFirstErrorBackoff();
+      await promptPromise;
+      await new Promise<void>(resolve => setTimeout(resolve, 50));
+
+      expect(ordinary.faux.state.callCount).toBe(2);
+      expect(ordinary.session.messages.filter(message => message.role === "custom")).toHaveLength(1);
+    } finally {
+      await ordinary.close();
     }
   });
 

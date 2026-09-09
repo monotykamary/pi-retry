@@ -161,16 +161,28 @@ function getHiddenTurnKind(agent: Agent): HiddenTurnKind | null {
   return null;
 }
 
-const ACTIVE_AGENT_TAG_PATTERN = /(?:^|\r?\n)<active_agent name="[^"\r\n]+"\/>((?:\r?\n)|$)/;
-
 /**
- * Recognize pi-subagents' standalone child marker in one effective prompt.
+ * Match one effective system prompt against the resolved policy rules.
+ *
+ * Rules are compiled during settings resolution and are evaluated only while
+ * classifying a session. Resetting lastIndex before and after each test keeps
+ * this helper safe if a future caller supplies a stateful RegExp instance.
  *
  * @param systemPrompt Effective SDK system prompt to inspect.
- * @returns True only for the generated standalone active_agent tag.
+ * @param rules Compiled user-configured regex rules.
+ * @returns True when any configured rule matches the prompt.
  */
-function hasNativeChildMarker(systemPrompt: string): boolean {
-  return ACTIVE_AGENT_TAG_PATTERN.test(systemPrompt);
+function matchesConfiguredSystemPrompt(
+  systemPrompt: string,
+  rules: readonly RegExp[],
+): boolean {
+  for (const rule of rules) {
+    rule.lastIndex = 0;
+    const matches = rule.test(systemPrompt);
+    rule.lastIndex = 0;
+    if (matches) return true;
+  }
+  return false;
 }
 
 /**
@@ -228,13 +240,22 @@ export default function (pi: ExtensionAPI) {
   ) {
     const sessionManager = ctx.sessionManager;
     if (!sessionManager || typeof sessionManager !== "object") return undefined;
-    const child = hasNativeChildMarker(systemPrompt ?? readEffectiveSystemPrompt(ctx));
     const settings = ctx.cwd === undefined
       ? {
           main: DEFAULT_RETRY_CONFIG,
-          subagents: { enabled: true, ...DEFAULT_RETRY_CONFIG },
+          subagents: {
+            enabled: true,
+            ...DEFAULT_RETRY_CONFIG,
+            match: { systemPromptRegex: [] },
+          },
         }
       : loadPiRetrySettings(ctx.cwd);
+    // Child policy selection is an explicit user-configured classification;
+    // an ordinary prompt only enters the inline path when a rule matches it.
+    const child = matchesConfiguredSystemPrompt(
+      systemPrompt ?? readEffectiveSystemPrompt(ctx),
+      settings.subagents.match.systemPromptRegex,
+    );
     const registered = registerRetrySession(sessionManager, owner, {
       isChild: child,
       suppressNativeRetry: !child || settings.subagents.enabled,
@@ -782,6 +803,12 @@ export default function (pi: ExtensionAPI) {
       // Wait for the current run to finish (activeRun resolves in
       // finishRun() after agent_end listeners return).
       await myAgent.waitForIdle();
+
+      // AgentSession clears its outer lifecycle immediately after Agent's
+      // active run resolves. Yield to the next macrotask so the detached path
+      // sends after that wrapper settles instead of queueing a follow-up and
+      // re-reading the same error before the host can drain it.
+      await new Promise<void>(resolve => setImmediate(resolve));
 
       // Re-check after waitForIdle: the user may have aborted or the
       // session may have changed while we were waiting.

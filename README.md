@@ -150,7 +150,9 @@ The example above waits 10 seconds before the first retry, doubles each delay, c
 
 ### Child sessions
 
-Native `pi-subagents` children use the generated standalone `<active_agent name="..."/>` marker in their effective system prompt. A child that loaded this extension inherits the effective main `piRetry` policy unless `piRetry.subagents` supplies overrides. This marker is a compatibility convention, not a security boundary: placing the same standalone tag in an ordinary session's system prompt or loaded context can also select the child policy.
+A loaded child session uses the `piRetry.subagents.match.systemPromptRegex` list to choose the existing inline child retry policy. Rules are user-configured regex **sources** (do not include `/.../` delimiters), compiled when settings load, and tested with OR semantics against the effective SDK system prompt. Matching selects the child policy; it does not enable or disable pi-retry as a whole, and it is not verification of child identity. An ordinary prompt can match intentionally.
+
+There is no built-in third-party marker or default child rule. When `subagents`, `match`, or `systemPromptRegex` is absent, when the list is empty, or when no rule matches, the session stays on ordinary pi-retry handling with the top-level parameters. This includes an old `<active_agent .../>` marker unless you explicitly configure a rule for it. A matched `enabled: false` rule leaves the SDK's native retry behavior untouched.
 
 ```json
 {
@@ -160,14 +162,26 @@ Native `pi-subagents` children use the generated standalone `<active_agent name=
     "multiplier": 2,
     "maxRetriesAtMaxDelay": 3,
     "subagents": {
-      "baseDelayMs": 500,
-      "maxRetriesAtMaxDelay": 5
+      "enabled": true,
+      "match": {
+        "systemPromptRegex": [
+          {
+            "pattern": "^<active_agent name=\"[^\"\\r\\n]+\"/>$",
+            "flags": "m"
+          }
+        ]
+      },
+      "baseDelayMs": 1000,
+      "maxDelayMs": 10000,
+      "multiplier": 2
     }
   }
 }
 ```
 
-`subagents` must be an object. Its numeric fields merge project over global settings and then fall back field-by-field to the effective main policy. The child policy is enabled by default when the object is absent; only `{ "enabled": false }` delegates that recognized child to Pi's native retry scheduler. Boolean shorthand such as `"subagents": false` and a top-level `piRetry.enabled` field are unsupported and do not disable child takeover. Invalid fields are warned about and fall back to their inherited values.
+In this example, the top-level policy is `2000/60000/2/3`. A matching prompt selects the child policy `1000/10000/2`, while its omitted `maxRetriesAtMaxDelay` inherits the effective main value. Child numeric fields inherit the effective main policy field by field. Project `systemPromptRegex` lists replace the global list wholesale, including an explicit empty list; they are never appended. If an explicitly supplied `match`, list, entry, pattern, or flags value is malformed, pi-retry warns with the setting path and treats that configured group as no matches instead of reviving an inherited rule. Accepted flags are unique `i`, `m`, `s`, and `u`; `g`, `y`, other flags, and duplicate flags are rejected.
+
+The matcher is a policy-selection convenience, not an identity or security boundary: copied prompt text can select the same policy in an ordinary session. JavaScript regex execution has no timeout. Malformed syntax is handled as a no-match configuration, but pathological user-authored regex runtime cannot be promised safe; pi-retry does not attempt heuristic ReDoS detection or sandboxing. Use trusted settings and keep patterns specific.
 
 Child takeover is available only when this extension is registered in that child session. Installing pi-retry globally or loading it in the parent does not guarantee that a foreground child loads it: foreground children do not inherit ambient extensions. Configure the agent used by the child explicitly, for example:
 

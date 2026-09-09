@@ -33,7 +33,7 @@ export interface RetrySessionBinding {
   agent: Agent;
   /** The extension API instance that owns this binding. */
   owner: ExtensionOwner;
-  /** Whether the session has pi-subagents' standalone child marker. */
+  /** Whether this session selected the configured child retry policy. */
   isChild: boolean;
   /** Whether pi-retry should suppress the SDK's native retry scheduler. */
   suppressNativeRetry: boolean;
@@ -152,7 +152,7 @@ export function getSessionAgent(sessionManager: unknown): Agent | undefined {
  *
  * @param sessionManager Session manager object from ExtensionContext.
  * @param owner Extension API instance that owns the registration.
- * @param options Child marker and native scheduler policy.
+ * @param options Policy classification and native scheduler policy.
  * @returns Binding and ownership flag; a duplicate factory is never the owner.
  */
 export function registerRetrySession(

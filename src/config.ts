@@ -22,7 +22,7 @@ export interface PiRetryConfig extends BackoffConfig {
  * Optional child-session fields accepted below piRetry.subagents.
  */
 export interface PiRetrySubagentsOverride {
-  /** Whether pi-retry takes over retries for recognized child sessions. */
+  /** Whether pi-retry takes over retries for sessions selected by the matcher. */
   enabled?: boolean;
   /** Delay before the first child retry, in milliseconds. */
   baseDelayMs?: number;
@@ -32,14 +32,29 @@ export interface PiRetrySubagentsOverride {
   multiplier?: number;
   /** Failed child retries allowed at the maximum delay. */
   maxRetriesAtMaxDelay?: number;
+  /** Optional policy-selection rules for effective system prompts. */
+  match?: {
+    /** User-provided regex rules compiled during settings resolution. */
+    systemPromptRegex?: unknown;
+  };
 }
 
 /**
- * Effective retry policy used by one recognized child session.
+ * Compiled child-policy selection rules.
+ */
+export interface PiRetrySubagentsMatchConfig {
+  /** Compiled regexes tested with OR semantics against one system prompt. */
+  systemPromptRegex: RegExp[];
+}
+
+/**
+ * Effective retry policy used by one session selected by child-policy rules.
  */
 export interface PiRetrySubagentsConfig extends PiRetryConfig {
-  /** Whether extension-managed child retry is enabled. */
+  /** Whether extension-managed retry is enabled for the selected session. */
   enabled: boolean;
+  /** Compiled rules that select this child policy for a system prompt. */
+  match: PiRetrySubagentsMatchConfig;
 }
 
 /**
@@ -48,7 +63,7 @@ export interface PiRetrySubagentsConfig extends PiRetryConfig {
 export interface PiRetrySettings {
   /** Effective policy for an ordinary session. */
   main: PiRetryConfig;
-  /** Effective policy for a recognized child; absent fields inherit main. */
+  /** Effective policy for a session selected by child-policy rules. */
   subagents: PiRetrySubagentsConfig;
 }
 
@@ -161,6 +176,122 @@ function getSubagentsSettings(
 }
 
 /**
+ * Warn about one malformed system-prompt matcher setting.
+ *
+ * @param path Fully qualified setting path shown to the user.
+ * @param value Invalid setting value.
+ * @param reason Short explanation of the validation failure.
+ */
+function warnInvalidSystemPromptRegex(
+  path: string,
+  value: unknown,
+  reason: string,
+): void {
+  console.warn(
+    `[pi-retry] Ignoring invalid ${path} value: ${String(value)} (${reason})`,
+  );
+}
+
+/**
+ * Validate the restricted, non-stateful flag set accepted by pi-retry.
+ *
+ * @param flags Regex flags supplied in settings.
+ * @returns True when every flag is unique and one of i, m, s, or u.
+ */
+function hasSupportedRegexFlags(flags: string): boolean {
+  const supported = new Set(["i", "m", "s", "u"]);
+  const seen = new Set<string>();
+  for (const flag of flags) {
+    if (!supported.has(flag) || seen.has(flag)) return false;
+    seen.add(flag);
+  }
+  return true;
+}
+
+/**
+ * Compile one explicitly supplied child matcher group.
+ *
+ * An absent match object returns undefined so a lower-precedence scope can be
+ * inherited. Any explicit malformed group returns an empty list, preventing a
+ * broader inherited rule from being selected accidentally.
+ *
+ * @param subagents Effective-scope child settings object, if present.
+ * @returns Compiled regexes, an empty invalid/explicit list, or undefined when absent.
+ */
+function compileSystemPromptRegexRules(
+  subagents: SettingsObject | undefined,
+): RegExp[] | undefined {
+  if (!subagents || !Object.hasOwn(subagents, "match")) return undefined;
+
+  const matchPath = `${PI_RETRY_SETTINGS_KEY}.subagents.match`;
+  const regexPath = `${matchPath}.systemPromptRegex`;
+  const match = subagents.match;
+  if (!isSettingsObject(match)) {
+    warnInvalidSystemPromptRegex(matchPath, match, "expected an object");
+    return [];
+  }
+  if (!Object.hasOwn(match, "systemPromptRegex")) {
+    warnInvalidSystemPromptRegex(regexPath, undefined, "expected an array");
+    return [];
+  }
+  const rules = match.systemPromptRegex;
+  if (!Array.isArray(rules)) {
+    warnInvalidSystemPromptRegex(regexPath, rules, "expected an array");
+    return [];
+  }
+
+  const compiled: RegExp[] = [];
+  for (const [index, rule] of rules.entries()) {
+    const rulePath = `${regexPath}[${index}]`;
+    if (!isSettingsObject(rule)) {
+      warnInvalidSystemPromptRegex(rulePath, rule, "expected an object");
+      return [];
+    }
+    const pattern = rule.pattern;
+    if (
+      typeof pattern !== "string" ||
+      pattern.trim().length === 0
+    ) {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.pattern`,
+        pattern,
+        "expected a non-empty regex source",
+      );
+      return [];
+    }
+    const rawFlags = rule.flags;
+    if (rawFlags !== undefined && typeof rawFlags !== "string") {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.flags`,
+        rawFlags,
+        "expected a string",
+      );
+      return [];
+    }
+    const flags = rawFlags ?? "";
+    if (!hasSupportedRegexFlags(flags)) {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.flags`,
+        flags,
+        "allowed flags are unique i, m, s, and u",
+      );
+      return [];
+    }
+    try {
+      compiled.push(new RegExp(pattern, flags));
+    } catch (error) {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.pattern`,
+        pattern,
+        `invalid regular expression: ${String(error)}`,
+      );
+      return [];
+    }
+  }
+  return compiled;
+}
+
+/**
  * Resolve the ordinary policy from global and project namespaces.
  *
  * @param globalSettings Decoded global settings.json contents.
@@ -208,9 +339,11 @@ function resolveMainRetryConfig(
  * Resolve main and child policies with explicit project-over-global precedence.
  *
  * The child object is field-merged from global then project settings and finally
- * overlaid on the effective main policy. An absent child object inherits main;
- * only `{ "enabled": false }` disables extension takeover for recognized child
- * sessions. Non-object child namespaces are warned about and ignored.
+ * overlaid on the effective main policy. An omitted project match group inherits
+ * the global compiled list, while an explicit project list replaces it wholesale.
+ * An absent child object inherits main; only `{ "enabled": false }` disables
+ * extension takeover for a matched child session. Non-object child namespaces
+ * are warned about and ignored.
  *
  * @param globalSettings Decoded global settings.json contents.
  * @param projectSettings Decoded project settings.json contents.
@@ -225,10 +358,17 @@ export function resolvePiRetrySettings(
   const main = resolveMainRetryConfig(globalSettings, projectSettings);
   const globalSubagents = getSubagentsSettings(globalSettings, "global");
   const projectSubagents = getSubagentsSettings(projectSettings, "project");
+  const globalSystemPromptRegex = compileSystemPromptRegexRules(globalSubagents);
+  const projectSystemPromptRegex = compileSystemPromptRegexRules(projectSubagents);
   const mergedSubagents = {
     ...(globalSubagents ?? {}),
     ...(projectSubagents ?? {}),
   } as SettingsObject & PiRetrySubagentsOverride;
+  // A present project list, including an empty or invalid one, wins over the
+  // global list. Only an omitted project match group inherits global rules.
+  const systemPromptRegex = projectSystemPromptRegex
+    ?? globalSystemPromptRegex
+    ?? [];
 
   return {
     main,
@@ -262,6 +402,9 @@ export function resolvePiRetrySettings(
         value => Number.isInteger(value) && value >= 1,
         `${PI_RETRY_SETTINGS_KEY}.subagents.maxRetriesAtMaxDelay`,
       ),
+      match: {
+        systemPromptRegex,
+      },
     },
   };
 }

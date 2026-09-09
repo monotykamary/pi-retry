@@ -36,7 +36,7 @@ export interface ChildRetryStatus {
 }
 
 /**
- * Owns retry scheduling for one recognized native child session.
+ * Owns retry scheduling for one session selected by the child-policy matcher.
  *
  * The controller deliberately runs one backoff inside the SDK's awaited
  * `agent_end` event. That keeps AgentSession.prompt() pending; after the
@@ -46,7 +46,7 @@ export interface ChildRetryStatus {
 export class ChildRetryController {
   /** Extension API bound to this exact child session. */
   private readonly pi: ExtensionAPI;
-  /** Agent whose transcript and queue belong to this child. */
+  /** Agent whose transcript and queue belong to this selected session. */
   private readonly agent: Agent;
   /** Stable policy resolved for this child at session startup. */
   private readonly config: PiRetrySubagentsConfig;
