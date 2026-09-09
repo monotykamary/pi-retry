@@ -15,6 +15,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+  recordRetrySessionAgent,
+  registerRetrySession,
+  unregisterRetrySession,
+} from "../../src/session-registry.js";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -24,7 +29,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-let activeMockAgent: { prompt(input: unknown[]): Promise<void> } | undefined;
+let activeMockAgent: { prompt(input: unknown[]): Promise<void>; state?: { messages: unknown[] } } | undefined;
+let activeMockSessionManager: { getEntries: ReturnType<typeof vi.fn> } | undefined;
+let activeMockOwner: object | undefined;
 
 // ── Helpers ──
 
@@ -52,9 +59,19 @@ function createMockAPI() {
 }
 
 function createMockCtx(entries: unknown[] = []) {
+  const sessionManager = activeMockSessionManager ?? { getEntries: vi.fn() };
+  sessionManager.getEntries.mockReturnValue(entries);
+  if (activeMockAgent && activeMockSessionManager && activeMockOwner) {
+    recordRetrySessionAgent(activeMockSessionManager, activeMockAgent as any);
+    registerRetrySession(activeMockSessionManager, activeMockOwner, {
+      isChild: false,
+      suppressNativeRetry: true,
+      childRetryEnabled: false,
+    });
+  }
   return {
     ui: { notify: vi.fn() },
-    sessionManager: { getEntries: vi.fn().mockReturnValue(entries) },
+    sessionManager,
   } as unknown as ExtensionCommandContext;
 }
 
@@ -68,10 +85,7 @@ function errorEntry(errorMessage: string, stopReason = "error"): object {
 async function setup() {
   vi.resetModules();
 
-  const { Agent } = await import("@earendil-works/pi-agent-core");
   const { AgentSession } = await import("@earendil-works/pi-coding-agent");
-  const origSubscribe = Agent.prototype.subscribe;
-  const origContinue = Agent.prototype.continue;
   const origPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
   const mod = await import("../../retry.ts");
@@ -79,24 +93,27 @@ async function setup() {
 
   const { api, handlers, commands } = createMockAPI();
   factory(api);
+  const sessionManager = { getEntries: vi.fn() };
+  activeMockSessionManager = sessionManager;
+  activeMockOwner = api as unknown as object;
 
   return {
     api,
     handlers,
     commands,
-    Agent,
+    sessionManager,
+    AgentSession,
     restore: () => {
-      Agent.prototype.subscribe = origSubscribe;
-      Agent.prototype.continue = origContinue;
-      // Restore the shared prototype so later tests start from Pi's native behavior.
+      unregisterRetrySession(sessionManager, activeMockOwner ?? api as unknown as object);
       (AgentSession.prototype as any)._prepareRetry = origPrepareRetry;
       activeMockAgent = undefined;
+      activeMockSessionManager = undefined;
+      activeMockOwner = undefined;
     },
   };
 }
 
 async function createAgentWithMessages(messages: any[], promptFn?: () => Promise<void>) {
-  const { Agent } = await import("@earendil-works/pi-agent-core");
   const agent = {
     listeners: new Set<Function>(),
     waitForIdle: vi.fn().mockResolvedValue(undefined),
@@ -111,12 +128,14 @@ async function createAgentWithMessages(messages: any[], promptFn?: () => Promise
     },
   };
   activeMockAgent = agent;
-  Agent.prototype.subscribe.call(agent, vi.fn());
   return agent;
 }
 
 async function advance(ms: number) {
-  await vi.advanceTimersByTimeAsync(ms);
+  const step = 100;
+  for (let remaining = ms; remaining > 0; remaining -= step) {
+    await vi.advanceTimersByTimeAsync(Math.min(step, remaining));
+  }
 }
 
 // ── Smoke tests ──
@@ -754,27 +773,43 @@ describe("smoke: /retry command", () => {
 
 describe("smoke: built-in retry suppression", () => {
   it("_prepareRetry returns false while pi-retry is active", async () => {
-    const { restore } = await setup();
+    const { restore, sessionManager } = await setup();
     try {
       const { AgentSession } = await import("@earendil-works/pi-coding-agent");
+      const agent = await createAgentWithMessages([
+        { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+      ]);
+      createMockCtx([errorEntry("Connection error")]);
       const prepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
       // Native retry must be disabled before agent_end can start pi-retry's loop.
-      await expect(prepareRetry.call({}, {})).resolves.toBe(false);
+      await expect(prepareRetry.call({
+        sessionManager,
+        settingsManager: { getRetrySettings: () => ({ enabled: true, maxRetries: 3 }) },
+        agent,
+      }, {})).resolves.toBe(false);
     } finally {
       restore();
     }
   });
 
   it("_prepareRetry is monkey-patched and functional", async () => {
-    const { restore } = await setup();
+    const { restore, sessionManager } = await setup();
     try {
       const { AgentSession } = await import("@earendil-works/pi-coding-agent");
 
       // Verify the monkey-patch is installed and returns the native retry guard.
+      const agent = await createAgentWithMessages([
+        { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+      ]);
+      createMockCtx([errorEntry("Connection error")]);
       const prepareRetry = (AgentSession.prototype as any)._prepareRetry;
       expect(typeof prepareRetry).toBe("function");
-      await expect(prepareRetry.call({}, {})).resolves.toBe(false);
+      await expect(prepareRetry.call({
+        sessionManager,
+        settingsManager: { getRetrySettings: () => ({ enabled: true, maxRetries: 3 }) },
+        agent,
+      }, {})).resolves.toBe(false);
     } finally {
       restore();
     }

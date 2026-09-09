@@ -19,6 +19,55 @@ export interface PiRetryConfig extends BackoffConfig {
 }
 
 /**
+ * Optional child-session fields accepted below piRetry.subagents.
+ */
+export interface PiRetrySubagentsOverride {
+  /** Whether pi-retry takes over retries for sessions selected by the matcher. */
+  enabled?: boolean;
+  /** Delay before the first child retry, in milliseconds. */
+  baseDelayMs?: number;
+  /** Maximum child retry delay, in milliseconds. */
+  maxDelayMs?: number;
+  /** Child retry exponential multiplier. */
+  multiplier?: number;
+  /** Failed child retries allowed at the maximum delay. */
+  maxRetriesAtMaxDelay?: number;
+  /** Optional policy-selection rules for effective system prompts. */
+  match?: {
+    /** User-provided regex rules compiled during settings resolution. */
+    systemPromptRegex?: unknown;
+  };
+}
+
+/**
+ * Compiled child-policy selection rules.
+ */
+export interface PiRetrySubagentsMatchConfig {
+  /** Compiled regexes tested with OR semantics against one system prompt. */
+  systemPromptRegex: RegExp[];
+}
+
+/**
+ * Effective retry policy used by one session selected by child-policy rules.
+ */
+export interface PiRetrySubagentsConfig extends PiRetryConfig {
+  /** Whether extension-managed retry is enabled for the selected session. */
+  enabled: boolean;
+  /** Compiled rules that select this child policy for a system prompt. */
+  match: PiRetrySubagentsMatchConfig;
+}
+
+/**
+ * Main and child policies resolved from the two Pi settings scopes.
+ */
+export interface PiRetrySettings {
+  /** Effective policy for an ordinary session. */
+  main: PiRetryConfig;
+  /** Effective policy for a session selected by child-policy rules. */
+  subagents: PiRetrySubagentsConfig;
+}
+
+/**
  * Default values preserve the extension's existing behavior while making it
  * possible to tune the schedule through settings.json.
  */
@@ -49,6 +98,7 @@ function isSettingsObject(value: unknown): value is SettingsObject {
  * @param key Setting name to read.
  * @param fallback Default value used for invalid or missing input.
  * @param isValid Predicate for the accepted numeric range.
+ * @param displayKey User-facing setting path used in warnings.
  * @returns A validated number.
  */
 function readNumberSetting(
@@ -56,6 +106,7 @@ function readNumberSetting(
   key: string,
   fallback: number,
   isValid: (value: number) => boolean,
+  displayKey = `${PI_RETRY_SETTINGS_KEY}.${key}`,
 ): number {
   const value = settings[key];
   if (value === undefined) return fallback;
@@ -64,9 +115,29 @@ function readNumberSetting(
   }
 
   // Invalid settings should not prevent pi from starting; use the field's
-  // default and make the configuration error visible to the user.
+  // inherited/default value and make the configuration error visible.
   console.warn(
-    `[pi-retry] Ignoring invalid ${PI_RETRY_SETTINGS_KEY}.${key} value: ${String(value)}`,
+    `[pi-retry] Ignoring invalid ${displayKey} value: ${String(value)}`,
+  );
+  return fallback;
+}
+
+/**
+ * Read a child enabled flag and fall back to the documented default.
+ *
+ * @param settings Child settings namespace to inspect.
+ * @param fallback Default enabled state.
+ * @returns A validated boolean.
+ */
+function readEnabledSetting(
+  settings: SettingsObject,
+  fallback: boolean,
+): boolean {
+  const value = settings.enabled;
+  if (value === undefined) return fallback;
+  if (typeof value === "boolean") return value;
+  console.warn(
+    `[pi-retry] Ignoring invalid ${PI_RETRY_SETTINGS_KEY}.subagents.enabled value: ${String(value)}`,
   );
   return fallback;
 }
@@ -84,15 +155,150 @@ function getRetrySettings(settings: unknown): SettingsObject {
 }
 
 /**
- * Merge global and project namespaces, then validate every supported field.
+ * Read a valid nested child namespace while preserving a valid lower scope.
+ *
+ * @param settings Decoded settings file contents.
+ * @param scopeName Global or project scope label for diagnostics.
+ * @returns The child namespace, or undefined when absent/invalid.
+ */
+function getSubagentsSettings(
+  settings: unknown,
+  scopeName: "global" | "project",
+): SettingsObject | undefined {
+  const retrySettings = getRetrySettings(settings);
+  if (!Object.hasOwn(retrySettings, "subagents")) return undefined;
+  const subagents = retrySettings.subagents;
+  if (isSettingsObject(subagents)) return subagents;
+  console.warn(
+    `[pi-retry] Ignoring invalid ${PI_RETRY_SETTINGS_KEY}.subagents namespace in ${scopeName} settings; expected an object.`,
+  );
+  return undefined;
+}
+
+/**
+ * Warn about one malformed system-prompt matcher setting.
+ *
+ * @param path Fully qualified setting path shown to the user.
+ * @param value Invalid setting value.
+ * @param reason Short explanation of the validation failure.
+ */
+function warnInvalidSystemPromptRegex(
+  path: string,
+  value: unknown,
+  reason: string,
+): void {
+  console.warn(
+    `[pi-retry] Ignoring invalid ${path} value: ${String(value)} (${reason})`,
+  );
+}
+
+/**
+ * Validate the restricted, non-stateful flag set accepted by pi-retry.
+ *
+ * @param flags Regex flags supplied in settings.
+ * @returns True when every flag is unique and one of i, m, s, or u.
+ */
+function hasSupportedRegexFlags(flags: string): boolean {
+  const supported = new Set(["i", "m", "s", "u"]);
+  const seen = new Set<string>();
+  for (const flag of flags) {
+    if (!supported.has(flag) || seen.has(flag)) return false;
+    seen.add(flag);
+  }
+  return true;
+}
+
+/**
+ * Compile one explicitly supplied child matcher group.
+ *
+ * An absent match object returns undefined so a lower-precedence scope can be
+ * inherited. Any explicit malformed group returns an empty list, preventing a
+ * broader inherited rule from being selected accidentally.
+ *
+ * @param subagents Effective-scope child settings object, if present.
+ * @returns Compiled regexes, an empty invalid/explicit list, or undefined when absent.
+ */
+function compileSystemPromptRegexRules(
+  subagents: SettingsObject | undefined,
+): RegExp[] | undefined {
+  if (!subagents || !Object.hasOwn(subagents, "match")) return undefined;
+
+  const matchPath = `${PI_RETRY_SETTINGS_KEY}.subagents.match`;
+  const regexPath = `${matchPath}.systemPromptRegex`;
+  const match = subagents.match;
+  if (!isSettingsObject(match)) {
+    warnInvalidSystemPromptRegex(matchPath, match, "expected an object");
+    return [];
+  }
+  if (!Object.hasOwn(match, "systemPromptRegex")) {
+    warnInvalidSystemPromptRegex(regexPath, undefined, "expected an array");
+    return [];
+  }
+  const rules = match.systemPromptRegex;
+  if (!Array.isArray(rules)) {
+    warnInvalidSystemPromptRegex(regexPath, rules, "expected an array");
+    return [];
+  }
+
+  const compiled: RegExp[] = [];
+  for (const [index, rule] of rules.entries()) {
+    const rulePath = `${regexPath}[${index}]`;
+    if (!isSettingsObject(rule)) {
+      warnInvalidSystemPromptRegex(rulePath, rule, "expected an object");
+      return [];
+    }
+    const pattern = rule.pattern;
+    if (
+      typeof pattern !== "string" ||
+      pattern.trim().length === 0
+    ) {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.pattern`,
+        pattern,
+        "expected a non-empty regex source",
+      );
+      return [];
+    }
+    const rawFlags = rule.flags;
+    if (rawFlags !== undefined && typeof rawFlags !== "string") {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.flags`,
+        rawFlags,
+        "expected a string",
+      );
+      return [];
+    }
+    const flags = rawFlags ?? "";
+    if (!hasSupportedRegexFlags(flags)) {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.flags`,
+        flags,
+        "allowed flags are unique i, m, s, and u",
+      );
+      return [];
+    }
+    try {
+      compiled.push(new RegExp(pattern, flags));
+    } catch (error) {
+      warnInvalidSystemPromptRegex(
+        `${rulePath}.pattern`,
+        pattern,
+        `invalid regular expression: ${String(error)}`,
+      );
+      return [];
+    }
+  }
+  return compiled;
+}
+
+/**
+ * Resolve the ordinary policy from global and project namespaces.
  *
  * @param globalSettings Decoded global settings.json contents.
  * @param projectSettings Decoded project settings.json contents.
- * @returns The validated effective retry configuration.
- *
- * TEST:__tests__/unit/config.test.ts[resolvePiRetryConfig]
+ * @returns The validated ordinary retry configuration.
  */
-export function resolvePiRetryConfig(
+function resolveMainRetryConfig(
   globalSettings: unknown,
   projectSettings: unknown,
 ): PiRetryConfig {
@@ -130,23 +336,127 @@ export function resolvePiRetryConfig(
 }
 
 /**
- * Load and merge Pi's global and project settings files.
+ * Resolve main and child policies with explicit project-over-global precedence.
+ *
+ * The child object is field-merged from global then project settings and finally
+ * overlaid on the effective main policy. An omitted project match group inherits
+ * the global compiled list, while an explicit project list replaces it wholesale.
+ * An absent child object inherits main; only `{ "enabled": false }` disables
+ * extension takeover for a matched child session. Non-object child namespaces
+ * are warned about and ignored.
+ *
+ * @param globalSettings Decoded global settings.json contents.
+ * @param projectSettings Decoded project settings.json contents.
+ * @returns Validated main and child retry policies.
+ *
+ * TEST:__tests__/unit/config.test.ts[resolvePiRetrySettings]
+ */
+export function resolvePiRetrySettings(
+  globalSettings: unknown,
+  projectSettings: unknown,
+): PiRetrySettings {
+  const main = resolveMainRetryConfig(globalSettings, projectSettings);
+  const globalSubagents = getSubagentsSettings(globalSettings, "global");
+  const projectSubagents = getSubagentsSettings(projectSettings, "project");
+  const globalSystemPromptRegex = compileSystemPromptRegexRules(globalSubagents);
+  const projectSystemPromptRegex = compileSystemPromptRegexRules(projectSubagents);
+  const mergedSubagents = {
+    ...(globalSubagents ?? {}),
+    ...(projectSubagents ?? {}),
+  } as SettingsObject & PiRetrySubagentsOverride;
+  // A present project list, including an empty or invalid one, wins over the
+  // global list. Only an omitted project match group inherits global rules.
+  const systemPromptRegex = projectSystemPromptRegex
+    ?? globalSystemPromptRegex
+    ?? [];
+
+  return {
+    main,
+    subagents: {
+      enabled: readEnabledSetting(mergedSubagents, true),
+      baseDelayMs: readNumberSetting(
+        mergedSubagents,
+        "baseDelayMs",
+        main.baseDelayMs,
+        value => value >= 0,
+        `${PI_RETRY_SETTINGS_KEY}.subagents.baseDelayMs`,
+      ),
+      maxDelayMs: readNumberSetting(
+        mergedSubagents,
+        "maxDelayMs",
+        main.maxDelayMs,
+        value => value >= 0,
+        `${PI_RETRY_SETTINGS_KEY}.subagents.maxDelayMs`,
+      ),
+      multiplier: readNumberSetting(
+        mergedSubagents,
+        "multiplier",
+        main.multiplier,
+        value => value >= 1,
+        `${PI_RETRY_SETTINGS_KEY}.subagents.multiplier`,
+      ),
+      maxRetriesAtMaxDelay: readNumberSetting(
+        mergedSubagents,
+        "maxRetriesAtMaxDelay",
+        main.maxRetriesAtMaxDelay,
+        value => Number.isInteger(value) && value >= 1,
+        `${PI_RETRY_SETTINGS_KEY}.subagents.maxRetriesAtMaxDelay`,
+      ),
+      match: {
+        systemPromptRegex,
+      },
+    },
+  };
+}
+
+/**
+ * Resolve only the ordinary retry configuration.
+ *
+ * @param globalSettings Decoded global settings.json contents.
+ * @param projectSettings Decoded project settings.json contents.
+ * @returns The validated effective retry configuration.
+ *
+ * TEST:__tests__/unit/config.test.ts[resolvePiRetryConfig]
+ */
+export function resolvePiRetryConfig(
+  globalSettings: unknown,
+  projectSettings: unknown,
+): PiRetryConfig {
+  return resolveMainRetryConfig(globalSettings, projectSettings);
+}
+
+/**
+ * Load and merge Pi's global, project, and nested child settings files.
  *
  * @param cwd Project working directory containing .pi/settings.json.
  * @param homeDirectory Home directory containing .pi/agent/settings.json.
- * @returns The validated effective retry configuration.
+ * @returns Validated ordinary and child retry configurations.
  *
- * TEST:__tests__/unit/config.test.ts[loadPiRetryConfig]
+ * TEST:__tests__/unit/config.test.ts[loadPiRetrySettings]
+ */
+export function loadPiRetrySettings(
+  cwd: string = process.cwd(),
+  homeDirectory: string = homedir(),
+): PiRetrySettings {
+  const globalSettings = readSettingsFile(
+    join(homeDirectory, ".pi", "agent", "settings.json"),
+  );
+  const projectSettings = readSettingsFile(join(cwd, ".pi", "settings.json"));
+  return resolvePiRetrySettings(globalSettings, projectSettings);
+}
+
+/**
+ * Load only the ordinary policy for compatibility with existing callers.
+ *
+ * @param cwd Project working directory containing .pi/settings.json.
+ * @param homeDirectory Home directory containing .pi/agent/settings.json.
+ * @returns The validated effective ordinary retry configuration.
  */
 export function loadPiRetryConfig(
   cwd: string = process.cwd(),
   homeDirectory: string = homedir(),
 ): PiRetryConfig {
-  const globalSettings = readSettingsFile(
-    join(homeDirectory, ".pi", "agent", "settings.json"),
-  );
-  const projectSettings = readSettingsFile(join(cwd, ".pi", "settings.json"));
-  return resolvePiRetryConfig(globalSettings, projectSettings);
+  return loadPiRetrySettings(cwd, homeDirectory).main;
 }
 
 /**

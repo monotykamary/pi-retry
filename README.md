@@ -146,9 +146,59 @@ The example above waits 10 seconds before the first retry, doubles each delay, c
 | `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
 | `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
 
-`piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
+`piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. For an ordinary session, the extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.
 
-Settings are read when the extension starts. Restart pi or use `/reload` after editing them.
+### Child sessions
+
+A loaded child session uses the `piRetry.subagents.match.systemPromptRegex` list to choose the existing inline child retry policy. Rules are user-configured regex **sources** (do not include `/.../` delimiters), compiled when settings load, and tested with OR semantics against the effective SDK system prompt. Matching selects the child policy; it does not enable or disable pi-retry as a whole, and it is not verification of child identity. An ordinary prompt can match intentionally.
+
+There is no built-in third-party marker or default child rule. When `subagents`, `match`, or `systemPromptRegex` is absent, when the list is empty, or when no rule matches, the session stays on ordinary pi-retry handling with the top-level parameters. This includes an old `<active_agent .../>` marker unless you explicitly configure a rule for it. A matched `enabled: false` rule leaves the SDK's native retry behavior untouched.
+
+```json
+{
+  "piRetry": {
+    "baseDelayMs": 2000,
+    "maxDelayMs": 60000,
+    "multiplier": 2,
+    "maxRetriesAtMaxDelay": 3,
+    "subagents": {
+      "enabled": true,
+      "match": {
+        "systemPromptRegex": [
+          {
+            "pattern": "^<active_agent name=\"[^\"\\r\\n]+\"/>$",
+            "flags": "m"
+          }
+        ]
+      },
+      "baseDelayMs": 1000,
+      "maxDelayMs": 10000,
+      "multiplier": 2
+    }
+  }
+}
+```
+
+In this example, the top-level policy is `2000/60000/2/3`. A matching prompt selects the child policy `1000/10000/2`, while its omitted `maxRetriesAtMaxDelay` inherits the effective main value. Child numeric fields inherit the effective main policy field by field. Project `systemPromptRegex` lists replace the global list wholesale, including an explicit empty list; they are never appended. If an explicitly supplied `match`, list, entry, pattern, or flags value is malformed, pi-retry warns with the setting path and treats that configured group as no matches instead of reviving an inherited rule. Accepted flags are unique `i`, `m`, `s`, and `u`; `g`, `y`, other flags, and duplicate flags are rejected.
+
+The matcher is a policy-selection convenience, not an identity or security boundary: copied prompt text can select the same policy in an ordinary session. JavaScript regex execution has no timeout. Malformed syntax is handled as a no-match configuration, but pathological user-authored regex runtime cannot be promised safe; pi-retry does not attempt heuristic ReDoS detection or sandboxing. Use trusted settings and keep patterns specific.
+
+Child takeover is available only when this extension is registered in that child session. Installing pi-retry globally or loading it in the parent does not guarantee that a foreground child loads it: foreground children do not inherit ambient extensions. Configure the agent used by the child explicitly, for example:
+
+```yaml
+---
+name: worker
+extensions:
+  - /absolute/path/to/retry.ts
+# Or load it only in child sessions:
+subagentOnlyExtensions:
+  - /absolute/path/to/retry.ts
+---
+```
+
+Use the corresponding `extensions`/`subagentOnlyExtensions` fields in the `pi-subagents` agent definition for the foreground or background launch. Background extension resolution may include ambient extensions when `extensions` is omitted, but explicit paths are the portable choice. pi-retry's child lifecycle adapter targets the private `AgentSession.bindExtensions`/`_prepareRetry` seam available in SDK 0.85.1. If a future SDK does not expose that seam, pi-retry leaves native retry behavior unchanged rather than taking over without a session identity.
+
+Main-session settings are refreshed at session startup and before each new agent prompt. An existing child controller retains its numeric backoff policy; start a new child to apply changed numeric values. Restart pi or use `/reload` to recreate extension state consistently.
 
 ---
 
@@ -162,7 +212,7 @@ Settings are read when the extension starts. Restart pi or use `/reload` after e
 6. **Valid provider context** — Hidden retry and continuation messages remain in context so providers never receive a trailing assistant message
 7. **Indefinite continuation** — Max_tokens auto-continues are uncapped; repeated `length` stops keep producing continuation turns until the model terminates normally
 8. **Empty-stop recovery** — A `stop` turn with no usable output (only thinking, or nothing at all) gets exactly one hidden "nudge" continuation, then gives up. Matches Anthropic's documented "empty responses with `end_turn`" remedy (continuation prompt in a new user message) — retrying an empty response in place doesn't help because the model has already decided it's done.
-8. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`, allowing status integrations to suppress intermediate completion signals
+9. **Lifecycle exposure** — Emits `pi-retry:started`, `pi-retry:completed`, and `pi-retry:cancelled` on Pi's shared extension event bus with a matching `retryId`. For child sessions, completion can mark a recovered model turn that proceeds to tools; it does not mean the entire child task has finished. Hosts must use the session prompt/lifecycle contract for task completion.
 
 The pi's built-in `transform-messages` already strips aborted/errored assistant messages from the LLM context, so the model never sees the failed attempts.
 
@@ -254,15 +304,20 @@ npm run lint:dead
 .
 ├── retry.ts                   # Main unified extension
 ├── src/                       # Shared utilities (testable, DRY)
+│   ├── child-retry.ts         # Inline retry lifecycle for recognized child sessions
+│   ├── session-registry.ts    # Shared SDK session identity and native-retry hook
 │   ├── config.ts             # Settings-backed retry configuration
 │   ├── error-patterns.ts      # Error pattern matching, custom types, hasMaxTokensStop
 │   ├── retry-logic.ts         # Retry utilities (calculateDelay, RetryState, ContinuationState, etc.)
 │   └── index.ts               # Barrel exports
-├── __tests__/                 # Unit tests
-│   └── unit/
-│       ├── config.test.ts
-│       ├── error-patterns.test.ts
-│       └── retry-logic.test.ts
+├── __tests__/
+│   ├── unit/
+│   │   ├── config.test.ts
+│   │   ├── error-patterns.test.ts
+│   │   ├── retry-logic.test.ts
+│   │   └── session-registry.test.ts
+│   └── integration/
+│       └── native-child-lifecycle.test.ts
 ├── vitest.config.ts           # Test configuration
 └── knip.json                  # Dead code detection config
 ```
@@ -271,7 +326,7 @@ npm run lint:dead
 
 ```bash
 # Run all quality checks
-npm test              # 224 tests
+npm test              # 249 tests
 npm run typecheck     # TypeScript type checking
 npm run lint:dead     # Dead code detection with knip
 ```

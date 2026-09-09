@@ -9,7 +9,9 @@ import { tmpdir } from "node:os";
 import {
   DEFAULT_RETRY_CONFIG,
   loadPiRetryConfig,
+  loadPiRetrySettings,
   resolvePiRetryConfig,
+  resolvePiRetrySettings,
 } from "../../src/config.js";
 
 const temporaryRoots: string[] = [];
@@ -55,6 +57,236 @@ function writeSettings(
   writeFileSync(filePath, JSON.stringify(settings), "utf8");
 }
 
+describe("resolvePiRetrySettings", () => {
+  // Absent child settings inherit the already effective main policy.
+  it("inherits the effective main policy when subagents is absent", () => {
+    const settings = resolvePiRetrySettings(
+      { piRetry: { baseDelayMs: 25, maxDelayMs: 500, multiplier: 1.5 } },
+      { piRetry: { multiplier: 2 } },
+    );
+
+    expect(settings.main).toEqual({
+      baseDelayMs: 25,
+      maxDelayMs: 500,
+      multiplier: 2,
+      maxRetriesAtMaxDelay: 3,
+    });
+    expect(settings.subagents).toEqual({
+      enabled: true,
+      ...settings.main,
+      match: { systemPromptRegex: [] },
+    });
+  });
+
+  // Nested project fields merge over nested global fields, then main values.
+  it("merges nested project fields over global and main settings", () => {
+    const settings = resolvePiRetrySettings(
+      {
+        piRetry: {
+          baseDelayMs: 10,
+          maxDelayMs: 100,
+          multiplier: 2,
+          subagents: { baseDelayMs: 3, multiplier: 1.25 },
+        },
+      },
+      {
+        piRetry: {
+          maxDelayMs: 200,
+          maxRetriesAtMaxDelay: 7,
+          subagents: { maxDelayMs: 33 },
+        },
+      },
+    );
+
+    expect(settings.main).toEqual({
+      baseDelayMs: 10,
+      maxDelayMs: 200,
+      multiplier: 2,
+      maxRetriesAtMaxDelay: 7,
+    });
+    expect(settings.subagents).toEqual({
+      enabled: true,
+      baseDelayMs: 3,
+      maxDelayMs: 33,
+      multiplier: 1.25,
+      maxRetriesAtMaxDelay: 7,
+      match: { systemPromptRegex: [] },
+    });
+  });
+
+  // Every invalid child field falls back independently to main policy values.
+  it("falls back per child field when nested values are invalid", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const settings = resolvePiRetrySettings(
+      {},
+      {
+        piRetry: {
+          subagents: {
+            enabled: "yes",
+            baseDelayMs: -1,
+            maxDelayMs: "large",
+            multiplier: 0,
+            maxRetriesAtMaxDelay: 1.5,
+          },
+        },
+      },
+    );
+
+    expect(settings.subagents).toEqual({
+      enabled: true,
+      ...DEFAULT_RETRY_CONFIG,
+      match: { systemPromptRegex: [] },
+    });
+    expect(warning).toHaveBeenCalledTimes(5);
+  });
+
+  // Boolean shorthand is invalid; only an object with enabled:false disables.
+  it("accepts enabled:false but ignores boolean shorthand", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const disabled = resolvePiRetrySettings({}, {
+      piRetry: { subagents: { enabled: false } },
+    });
+    const shorthand = resolvePiRetrySettings({}, {
+      piRetry: { subagents: false },
+    });
+
+    expect(disabled.subagents.enabled).toBe(false);
+    expect(shorthand.subagents).toEqual({
+      enabled: true,
+      ...DEFAULT_RETRY_CONFIG,
+      match: { systemPromptRegex: [] },
+    });
+    expect(warning).toHaveBeenCalledOnce();
+  });
+
+  // An invalid project namespace cannot erase a valid global child policy.
+  it("warns and retains the valid global namespace when project is invalid", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const settings = resolvePiRetrySettings(
+      { piRetry: { subagents: { baseDelayMs: 11 } } },
+      { piRetry: { subagents: ["invalid"] } },
+    );
+
+    expect(settings.subagents.baseDelayMs).toBe(11);
+    expect(settings.subagents.enabled).toBe(true);
+    expect(warning).toHaveBeenCalledOnce();
+  });
+
+  // The unsupported top-level enabled field must not disable child takeover.
+  it("does not treat top-level enabled as the child switch", () => {
+    const settings = resolvePiRetrySettings({}, {
+      piRetry: { enabled: false },
+    });
+
+    expect(settings.subagents.enabled).toBe(true);
+  });
+
+  // A configured list compiles each source and selects a match with OR semantics.
+  it("compiles arbitrary system-prompt regex rules with flags", () => {
+    const settings = resolvePiRetrySettings({}, {
+      piRetry: {
+        subagents: {
+          match: {
+            systemPromptRegex: [
+              { pattern: "<ordinary-child>", flags: "i" },
+              { pattern: "^second$", flags: "m" },
+              { pattern: "/path/segment" },
+            ],
+          },
+        },
+      },
+    });
+
+    const rules = settings.subagents.match.systemPromptRegex;
+    expect(rules).toHaveLength(3);
+    expect(rules[0]).toBeInstanceOf(RegExp);
+    expect(rules[0]?.flags).toBe("i");
+    expect(rules[0]?.test("<ORDINARY-CHILD>")).toBe(true);
+    expect(rules[1]?.test("first\nsecond\nthird")).toBe(true);
+    expect(rules[2]?.test("/path/segment")).toBe(true);
+  });
+
+  // Slash characters are valid regex source and are never parsed as delimiters.
+  it("accepts slash-containing regex sources", () => {
+    const valid = resolvePiRetrySettings({}, {
+      piRetry: {
+        subagents: {
+          match: { systemPromptRegex: [{ pattern: "/path/segment" }] },
+        },
+      },
+    });
+    const slashDelimited = resolvePiRetrySettings({}, {
+      piRetry: {
+        subagents: {
+          match: { systemPromptRegex: [{ pattern: "/path/" }] },
+        },
+      },
+    });
+
+    expect(valid.subagents.match.systemPromptRegex).toHaveLength(1);
+    expect(slashDelimited.subagents.match.systemPromptRegex).toHaveLength(1);
+  });
+
+  // A project list replaces the global list, while an omitted project list inherits it.
+  it("replaces or inherits the configured project regex list", () => {
+    const global = {
+      piRetry: {
+        subagents: {
+          match: { systemPromptRegex: [{ pattern: "global" }] },
+        },
+      },
+    };
+    const inherited = resolvePiRetrySettings(global, { piRetry: { subagents: {} } });
+    const replaced = resolvePiRetrySettings(global, {
+      piRetry: {
+        subagents: {
+          match: { systemPromptRegex: [{ pattern: "project" }] },
+        },
+      },
+    });
+    const disabled = resolvePiRetrySettings(global, {
+      piRetry: { subagents: { match: { systemPromptRegex: [] } } },
+    });
+
+    expect(inherited.subagents.match.systemPromptRegex[0]?.source).toBe("global");
+    expect(replaced.subagents.match.systemPromptRegex).toHaveLength(1);
+    expect(replaced.subagents.match.systemPromptRegex[0]?.source).toBe("project");
+    expect(disabled.subagents.match.systemPromptRegex).toEqual([]);
+  });
+
+  // A malformed explicit project group disables matching instead of reviving global rules.
+  it("invalidates the whole explicit match group on malformed input", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const settings = resolvePiRetrySettings(
+      {
+        piRetry: {
+          subagents: {
+            match: { systemPromptRegex: [{ pattern: "global" }] },
+          },
+        },
+      },
+      {
+        piRetry: {
+          subagents: {
+            match: { systemPromptRegex: [{ pattern: "project", flags: "g" }] },
+          },
+        },
+      },
+    );
+
+    expect(settings.subagents.match.systemPromptRegex).toEqual([]);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("piRetry.subagents.match.systemPromptRegex[0].flags"),
+    );
+  });
+
+  // Missing child-match configuration preserves ordinary pi-retry takeover.
+  it("has no implicit child matcher when match configuration is absent", () => {
+    const settings = resolvePiRetrySettings({}, {});
+
+    expect(settings.subagents.match.systemPromptRegex).toEqual([]);
+  });
+});
 describe("resolvePiRetryConfig", () => {
   it("preserves defaults when no piRetry namespace is present", () => {
     expect(resolvePiRetryConfig({}, {})).toEqual(DEFAULT_RETRY_CONFIG);
@@ -126,6 +358,24 @@ describe("loadPiRetryConfig", () => {
     const { root, home } = createSettingsTree();
 
     expect(loadPiRetryConfig(root, home)).toEqual(DEFAULT_RETRY_CONFIG);
+  });
+
+  it("compiles child match rules while loading settings files", () => {
+    const { root, home } = createSettingsTree();
+    writeSettings("project", root, home, {
+      piRetry: {
+        subagents: {
+          match: {
+            systemPromptRegex: [{ pattern: "^worker$", flags: "m" }],
+          },
+        },
+      },
+    });
+
+    const settings = loadPiRetrySettings(root, home);
+    const rule = settings.subagents.match.systemPromptRegex[0];
+    expect(rule).toBeInstanceOf(RegExp);
+    expect(rule?.test("worker")).toBe(true);
   });
 
   it("ignores malformed JSON without preventing startup", () => {

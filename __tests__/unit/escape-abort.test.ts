@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  recordRetrySessionAgent,
+  unregisterRetrySession,
+} from "../../src/session-registry.js";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -25,10 +29,8 @@ function errorEntry(errorMessage: string): object {
 async function setup() {
   vi.resetModules();
 
-  const { Agent } = await import("@earendil-works/pi-agent-core");
   const { AgentSession } = await import("@earendil-works/pi-coding-agent");
-  const originalSubscribe = Agent.prototype.subscribe;
-  const originalContinue = Agent.prototype.continue;
+  const originalContinue = (await import("@earendil-works/pi-agent-core")).Agent.prototype.continue;
   const originalPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
 
   const handlers: Record<string, Function[]> = {};
@@ -81,8 +83,6 @@ async function setup() {
     return activePrompt;
   });
 
-  Agent.prototype.subscribe.call(agent, vi.fn());
-
   let terminalInputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   const terminalInputUnsubscribe = vi.fn();
   const abort = vi.fn(() => resolvePrompt?.());
@@ -94,6 +94,10 @@ async function setup() {
     resolvePrompt?.();
   });
   const entries = [errorEntry("Connection error")];
+  const sessionManager = {
+    getEntries: vi.fn().mockReturnValue(entries),
+  };
+  recordRetrySessionAgent(sessionManager, agent as any);
   const ctx = {
     mode: "tui",
     ui: {
@@ -103,9 +107,7 @@ async function setup() {
         return terminalInputUnsubscribe;
       }),
     },
-    sessionManager: {
-      getEntries: vi.fn().mockReturnValue(entries),
-    },
+    sessionManager,
     isIdle: () => true,
     get signal() {
       return abortController.signal;
@@ -148,8 +150,7 @@ async function setup() {
   function restore(): void {
     resolvePrompt?.();
     terminalInputUnsubscribe();
-    Agent.prototype.subscribe = originalSubscribe;
-    Agent.prototype.continue = originalContinue;
+    unregisterRetrySession(sessionManager, api as unknown as object);
     (AgentSession.prototype as any)._prepareRetry = originalPrepareRetry;
   }
 
@@ -168,12 +169,19 @@ async function setup() {
   };
 }
 
+async function advanceTimers(ms: number): Promise<void> {
+  const step = 100;
+  for (let remaining = ms; remaining > 0; remaining -= step) {
+    await vi.advanceTimersByTimeAsync(Math.min(step, remaining));
+  }
+}
+
 describe("retry Escape handling", () => {
   it("aborts a streaming retry even when AgentSession reports idle", async () => {
     const fixture = await setup();
     try {
       fixture.fireAgentEnd();
-      await vi.advanceTimersByTimeAsync(2100);
+      await advanceTimers(2100);
 
       expect(fixture.agent.prompt).toHaveBeenCalledTimes(1);
       expect(fixture.agent.state.isStreaming).toBe(true);
@@ -183,7 +191,7 @@ describe("retry Escape handling", () => {
       expect(fixture.queuedFollowUps).toEqual([]);
       expect(fixture.abort).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(60000);
+      await advanceTimers(60000);
       expect(fixture.agent.state.isStreaming).toBe(false);
       expect(fixture.agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
@@ -195,14 +203,14 @@ describe("retry Escape handling", () => {
     const fixture = await setup();
     try {
       fixture.fireAgentEnd();
-      await vi.advanceTimersByTimeAsync(500);
+      await advanceTimers(500);
 
       fixture.pressEscape();
       expect(fixture.nativeInterrupt).toHaveBeenCalledTimes(1);
       expect(fixture.queuedFollowUps).toEqual([]);
       expect(fixture.abort).not.toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(5000);
+      await advanceTimers(5000);
       expect(fixture.agent.prompt).not.toHaveBeenCalled();
     } finally {
       fixture.restore();
@@ -221,7 +229,7 @@ describe("retry Escape handling", () => {
       });
       fixture.fireAgentEnd();
 
-      await vi.advanceTimersByTimeAsync(5000);
+      await advanceTimers(5000);
       expect(fixture.agent.prompt).not.toHaveBeenCalled();
     } finally {
       fixture.restore();
@@ -241,7 +249,7 @@ describe("retry Escape handling", () => {
       await fixture.fireInput();
       fixture.fireAgentEnd();
 
-      await vi.advanceTimersByTimeAsync(2100);
+      await advanceTimers(2100);
       expect(fixture.agent.prompt).toHaveBeenCalledTimes(1);
     } finally {
       fixture.restore();
@@ -252,7 +260,7 @@ describe("retry Escape handling", () => {
     const fixture = await setup();
     try {
       fixture.fireAgentEnd();
-      await vi.advanceTimersByTimeAsync(2100);
+      await advanceTimers(2100);
 
       expect(fixture.agent.state.isStreaming).toBe(true);
       await fixture.startSession();
