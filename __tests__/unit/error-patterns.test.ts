@@ -12,8 +12,6 @@ import {
   isNonRetryableError,
   isSilencedError,
   hasQuotaExhaustedError,
-  hasMaxTokensStop,
-  hasEmptyStop,
   isContextOverflowError,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
@@ -377,43 +375,6 @@ describe('CONNECTION_ERROR_PATTERNS', () => {
   });
 });
 
-describe('hasMaxTokensStop', () => {
-  it('returns true for assistant messages with stopReason "length"', () => {
-    const msg = { role: 'assistant', stopReason: 'length', content: [] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(true);
-  });
-
-  it('returns false for assistant messages with stopReason "stop"', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(false);
-  });
-
-  it('returns false for assistant messages with stopReason "toolUse"', () => {
-    const msg = { role: 'assistant', stopReason: 'toolUse', content: [] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(false);
-  });
-
-  it('returns false for assistant messages with stopReason "error"', () => {
-    const msg = { role: 'assistant', stopReason: 'error', errorMessage: 'something', content: [] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(false);
-  });
-
-  it('returns false for assistant messages with stopReason "aborted"', () => {
-    const msg = { role: 'assistant', stopReason: 'aborted', content: [] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(false);
-  });
-
-  it('returns false for user messages', () => {
-    const msg = { role: 'user', content: [{ type: 'text', text: 'test' }] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(false);
-  });
-
-  it('returns false for toolResult messages', () => {
-    const msg = { role: 'toolResult', content: [] } as unknown as AgentMessage;
-    expect(hasMaxTokensStop(msg)).toBe(false);
-  });
-});
-
 describe('hasQuotaExhaustedError', () => {
   const createAssistantError = (errorMessage: string): AgentMessage =>
     ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
@@ -564,66 +525,3 @@ describe('quota patterns do not false-positive on transient/balance errors', () 
     expect(hasRetryableError(msg)).toBe(true);
   });
 });
-
-describe('hasEmptyStop', () => {
-  it('returns true for empty content with stopReason stop', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(true);
-  });
-
-  it('returns true for thinking-only content (no text, no toolCall)', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [{ type: 'thinking', thinking: 'let me think...' }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(true);
-  });
-
-  it('returns true for whitespace-only text', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: '   ' }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(true);
-  });
-
-  it('returns false for a real text answer', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Here is the summary.' }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for a toolCall stop', () => {
-    const msg = { role: 'assistant', stopReason: 'toolUse', content: [{ type: 'toolCall', id: 't1', name: 'pi.bash', arguments: {} }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for stop with text + toolCall content', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'ok' }, { type: 'toolCall', id: 't1', name: 'pi.bash', arguments: {} }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for max_tokens stop', () => {
-    const msg = { role: 'assistant', stopReason: 'length', content: [] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for error stops', () => {
-    const msg = { role: 'assistant', stopReason: 'error', errorMessage: 'boom', content: [] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for aborted stops', () => {
-    const msg = { role: 'assistant', stopReason: 'aborted', content: [] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for a real final text-only answer (the legit stop case)', () => {
-    const msg = { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Here is the full deliverable: ...' }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for non-assistant messages', () => {
-    const msg = { role: 'user', content: [{ type: 'text', text: 'hi' }] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-
-  it('returns false for toolResult messages', () => {
-    const msg = { role: 'toolResult', content: [] } as unknown as AgentMessage;
-    expect(hasEmptyStop(msg)).toBe(false);
-  });
-});
-

@@ -1,220 +1,274 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+/**
+ * Regression tests for reported retry behaviors, rebased onto the native seam.
+ *
+ * - Manual /retry continues even after the automatic retry cap is exhausted.
+ * - Per-category counters are independent: exhausting one category's cap does
+ *   not block retries for a different error category.
+ * - The delegated backoff schedule matches the configured base/multiplier/cap.
+ * - Resetting one session's counters never leaks into sibling sessions.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Agent } from "@earendil-works/pi-agent-core";
+import { DEFAULT_RETRY_CONFIG } from "../../src/config.js";
 import {
   recordRetrySessionAgent,
   registerRetrySession,
   unregisterRetrySession,
+  getRetrySession,
+  type AgentSessionLike,
 } from "../../src/session-registry.js";
 
-// Keep this regression seam deterministic while exercising retry.ts's real driver.
-beforeEach(() => vi.useFakeTimers());
+beforeEach(() => {
+  vi.useFakeTimers();
+});
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
-let activeAgent: {
-  prompt(input: unknown[]): Promise<unknown>;
-  waitForIdle(): Promise<void>;
-  state: { messages: any[] };
-} | undefined;
-// The fake owner lets the registry bind the test Agent to retry.ts.
-let activeOwner: object | undefined;
+const registeredManagers: Array<{ manager: object; owner: object }> = [];
 
-/**
- * Build one session entry containing the assistant stop condition under test.
- *
- * @param stopReason Assistant stop reason represented by the entry.
- * @returns A session-manager-compatible message entry.
- */
-function errorEntry(stopReason = "error") {
-  return {
-    type: "message",
-    message: {
-      role: "assistant",
-      stopReason,
-      errorMessage: stopReason === "error" ? "connection error" : undefined,
-      content: stopReason === "length" ? [{ type: "text", text: "partial" }] : [],
-    },
-  };
+function track(manager: object, owner: object): void {
+  registeredManagers.push({ manager, owner });
 }
 
-/**
- * Create the smallest ExtensionAPI surface used by the ordinary retry driver.
- *
- * @returns Fake API, event handlers, and registered commands.
- */
-function createApi() {
+afterEach(() => {
+  for (const { manager, owner } of registeredManagers.splice(0)) {
+    unregisterRetrySession(manager, owner);
+  }
+});
+
+function errorMessage(text: string): any {
+  return { role: "assistant", stopReason: "error", errorMessage: text, content: [] };
+}
+
+function userMessage(): any {
+  return { role: "user", content: [{ type: "text", text: "go" }] };
+}
+
+function createMockAPI() {
   const handlers: Record<string, Function[]> = {};
-  const commands: Record<string, { handler: (args: string[], ctx: any) => Promise<void> }> = {};
+  const commands: Record<string, { handler: (args: string, ctx: any) => Promise<void> }> = {};
   const api = {
     events: { emit: vi.fn(), on: vi.fn(() => () => {}) },
     on(event: string, handler: Function) {
       (handlers[event] ??= []).push(handler);
     },
-    registerCommand(name: string, options: { handler: (args: string[], ctx: any) => Promise<void> }) {
-      commands[name] = options;
+    registerCommand(name: string, opts: { handler: (args: string, ctx: any) => Promise<void> }) {
+      commands[name] = opts;
     },
-    sendMessage: vi.fn((message: unknown) => {
-      void activeAgent?.prompt([message]).catch(() => undefined);
-    }),
-  } as any;
+  } as unknown as ExtensionAPI;
   return { api, handlers, commands };
 }
 
-/**
- * Load retry.ts against a fresh fake extension runtime.
- *
- * @returns Test fixtures and a cleanup callback.
- */
-async function setup() {
+async function loadExtension() {
   vi.resetModules();
   const { AgentSession } = await import("@earendil-works/pi-coding-agent");
-  const originalPrepareRetry = (AgentSession.prototype as any)._prepareRetry;
-  const { default: retryExtension } = await import("../../retry.ts");
-  const { api, handlers, commands } = createApi();
-  retryExtension(api);
-  const manager = { getEntries: vi.fn() };
-  const owner = api as object;
-  activeOwner = owner;
-  const ui = { notify: vi.fn(), setStatus: vi.fn() };
-  const ctx: any = { sessionManager: manager, ui };
-  const restore = () => {
-    unregisterRetrySession(manager, owner);
-    (AgentSession.prototype as any)._prepareRetry = originalPrepareRetry;
-    activeAgent = undefined;
-    activeOwner = undefined;
-  };
-  return { api, commands, ctx, handlers, manager, restore, ui };
-}
+  const prototype = AgentSession.prototype as unknown as Record<PropertyKey, any>;
+  const realPrepare = prototype._prepareRetry;
+  const delegateSpy = vi.fn(realPrepare);
+  prototype._prepareRetry = delegateSpy;
 
-/**
- * Bind a fake Agent to the current session registry owner.
- *
- * @param manager Session-manager identity used by retry.ts.
- * @param responses Callback that updates the Agent after each hidden turn.
- * @returns The bound fake Agent.
- */
-function attachAgent(manager: { getEntries: ReturnType<typeof vi.fn> }, responses: (agent: any) => void) {
-  const agent = {
-    prompt: vi.fn(() => {
-      responses(agent);
-      return Promise.resolve();
-    }),
-    waitForIdle: vi.fn().mockResolvedValue(undefined),
-    state: {
-      messages: [{ role: "assistant", stopReason: "error", errorMessage: "connection error", content: [] }],
+  const mod = await import("../../retry.ts");
+  const { api, handlers, commands } = createMockAPI();
+  mod.default(api);
+
+  return {
+    api,
+    handlers,
+    commands,
+    prototype,
+    delegateSpy,
+    restore: () => {
+      prototype._prepareRetry = realPrepare;
     },
   };
-  activeAgent = agent;
-  recordRetrySessionAgent(manager, agent as any);
-  registerRetrySession(manager, activeOwner!, {
-    isChild: false,
-    suppressNativeRetry: true,
-    childRetryEnabled: false,
-  });
-  return agent;
 }
 
-/**
- * Advance fake timers in short steps so interval-based cancellation is flushed.
- *
- * @param ms Amount of virtual time to advance.
- */
-async function advance(ms: number) {
-  for (let remaining = ms; remaining > 0; remaining -= 100) {
-    await vi.advanceTimersByTimeAsync(Math.min(100, remaining));
-  }
+function createFakeSession(options: { manager: object }) {
+  const agent = {
+    state: { messages: [userMessage()] as any[] },
+  } as Agent;
+  return {
+    sessionManager: options.manager,
+    agent,
+    settingsManager: {
+      getRetrySettings: vi.fn(() => ({
+        enabled: true,
+        maxRetries: 3,
+        baseDelayMs: 2000,
+        maxAgentDelayMs: 60000,
+      })),
+    },
+    _retryAttempt: 0,
+    _emit: vi.fn(),
+    model: undefined,
+  } as unknown as AgentSessionLike & {
+    _retryAttempt: number;
+    _emit: ReturnType<typeof vi.fn>;
+    agent: Agent;
+    settingsManager: { getRetrySettings: ReturnType<typeof vi.fn> };
+  };
 }
 
-describe("reported retry regressions", () => {
-  // A continuation is not an ordinary retry and must not consume its exponential slot.
-  it("keeps ordinary retry backoff independent from a max-token continuation", async () => {
-    const { api, handlers, manager, ctx, restore } = await setup();
+function registerManaged(
+  manager: object,
+  owner: object,
+  config = DEFAULT_RETRY_CONFIG,
+  managedRetry = true,
+  isChild = false,
+  agent?: Agent,
+  session?: AgentSessionLike,
+) {
+  recordRetrySessionAgent(manager, agent ?? ({} as Agent), session);
+  track(manager, owner);
+  return registerRetrySession(manager, owner, {
+    isChild,
+    managedRetry,
+    config,
+  })!.binding;
+}
+
+async function prepare(ext: Awaited<ReturnType<typeof loadExtension>>, session: AgentSessionLike, message: unknown): Promise<boolean> {
+  const promise = (ext.prototype._prepareRetry as any).call(session, message);
+  await vi.advanceTimersByTimeAsync(130_000);
+  return promise;
+}
+
+describe("reported retry regressions (native seam)", () => {
+  // Manual /retry is explicit intent: it bypasses the classifier and veto, so
+  // a session that exhausted its automatic retries stays manually recoverable.
+  it("allows manual /retry continue after the automatic cap is exhausted", async () => {
+    const ext = await loadExtension();
     try {
-      let calls = 0;
-      const sent: Array<{ kind: string; at: number }> = [];
-      const agent = attachAgent(manager, currentAgent => {
-        calls++;
-        if (calls === 1) {
-          currentAgent.state.messages = [{ role: "assistant", stopReason: "length", content: [{ type: "text", text: "partial" }] }];
-        } else if (calls === 2) {
-          currentAgent.state.messages = [{ role: "assistant", stopReason: "error", errorMessage: "connection error", content: [] }];
-        } else {
-          currentAgent.state.messages = [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }];
-        }
-      });
-      api.sendMessage.mockImplementation((message: any) => {
-        sent.push({ kind: message.customType, at: Date.now() });
-        void agent.prompt();
-      });
-      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
-      for (const handler of handlers["agent_end"] ?? []) {
-        void handler({ messages: [] }, ctx);
-      }
-      await advance(20_000);
+      const manager = {};
+      const cap = 100;
+      const session = createFakeSession({ manager });
+      registerManaged(manager, ext.api as unknown as object, {
+        baseDelayMs: cap,
+        maxDelayMs: cap,
+        multiplier: 2,
+        maxRetriesAtMaxDelay: 3,
+      }, true, false, session.agent, session);
+      const failure = errorMessage("Connection error");
 
-      // The two ordinary retries should be separated by 4s, not by an 8s slot consumed by continuation.
-      const retryTimes = sent.filter(message => message.kind === "pi-retry:retry").map(message => message.at);
-      expect(retryTimes.map(time => time - retryTimes[0]!)).toEqual([0, 8_000]);
+      for (let i = 0; i < 3; i++) {
+        expect(await prepare(ext, session, failure)).toBe(true);
+      }
+      expect(await prepare(ext, session, failure)).toBe(false);
+
+      // Manual continue: pop the error and continue, no backoff, no veto.
+      const user = userMessage();
+      session.agent.state.messages = [user, failure];
+      (session as any)._omitRecoveryAttempt = vi.fn(() => {
+        session.agent.state.messages = [user];
+      });
+      session.agent.continue = vi.fn(async () => {});
+
+      const ctx = { sessionManager: manager, ui: { notify: vi.fn() } };
+      await ext.commands["retry"].handler("", ctx);
+      expect((session as any)._omitRecoveryAttempt).toHaveBeenCalledWith(failure);
+      expect(session.agent.continue).toHaveBeenCalledTimes(1);
     } finally {
-      restore();
+      ext.restore();
     }
   });
 
-  // TEST:__tests__/unit/user-retry-regression.test.ts[ordinary retry countdown status]
-  it("updates and clears one footer status row during ordinary backoff", async () => {
-    const { handlers, manager, ctx, restore, ui } = await setup();
+  // Counters are per category: a connection storm must not eat the credit
+  // retry budget (and vice versa).
+  it("keeps per-category caps independent", async () => {
+    const ext = await loadExtension();
     try {
-      const agent = attachAgent(manager, currentAgent => {
-        currentAgent.state.messages = [
-          { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
-        ];
+      const manager = {};
+      registerManaged(manager, ext.api as unknown as object, {
+        baseDelayMs: 100,
+        maxDelayMs: 100,
+        multiplier: 2,
+        maxRetriesAtMaxDelay: 3,
       });
-      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
-      for (const handler of handlers["agent_end"] ?? []) {
-        void handler({ messages: [] }, ctx);
-      }
+      const session = createFakeSession({ manager });
+      const connection = errorMessage("Connection error");
+      const credit = errorMessage("not enough credits");
 
-      await advance(100);
-      expect(ui.setStatus).toHaveBeenCalledWith(
-        "pi-retry-backoff",
-        "Retry attempt 1 - retrying in 2.0s",
-      );
-      await advance(1_900);
-      expect(ui.setStatus).toHaveBeenLastCalledWith("pi-retry-backoff", undefined);
-      expect(ui.notify).not.toHaveBeenCalledWith(
-        expect.stringContaining("Retry attempt 1"),
-        "info",
-      );
-      expect(agent.prompt).toHaveBeenCalledTimes(1);
+      for (let i = 0; i < 3; i++) {
+        expect(await prepare(ext, session, connection)).toBe(true);
+      }
+      expect(await prepare(ext, session, connection)).toBe(false);
+
+      // A different category still gets its full budget.
+      expect(await prepare(ext, session, credit)).toBe(true);
     } finally {
-      restore();
+      ext.restore();
     }
   });
 
-  // The ordinary driver already owns a completed loop before manual retry starts.
-  // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry after ordinary cap]
-  it("allows manual retry after the ordinary retry cap", async () => {
-    const { commands, handlers, manager, ctx, restore } = await setup();
+  // The delegated schedule must match base * multiplier^(N-1) with the cap.
+  it("follows the configured backoff schedule through native delays", async () => {
+    const ext = await loadExtension();
     try {
-      const agent = attachAgent(manager, currentAgent => {
-        currentAgent.state.messages = [
-          { role: "assistant", stopReason: "error", errorMessage: "connection error", content: [] },
-        ];
+      const manager = {};
+      registerManaged(manager, ext.api as unknown as object, {
+        baseDelayMs: 2000,
+        maxDelayMs: 8000,
+        multiplier: 2,
+        maxRetriesAtMaxDelay: 3,
       });
-      (ctx.sessionManager.getEntries as any).mockReturnValue([errorEntry()]);
-      for (const handler of handlers["agent_end"] ?? []) {
-        void handler({ messages: [] }, ctx);
+      const session = createFakeSession({ manager });
+      const failure = errorMessage("Connection error");
+
+      const expected = [2000, 4000, 8000, 8000, 8000];
+      for (const delay of expected) {
+        const promise = (ext.prototype._prepareRetry as any).call(session, failure);
+        await vi.advanceTimersByTimeAsync(delay);
+        expect(await promise).toBe(true);
+        expect(session._emit).toHaveBeenLastCalledWith(
+          expect.objectContaining({ delayMs: delay }),
+        );
       }
-      await advance(250_000);
-      const attemptsBeforeManual = agent.prompt.mock.calls.length;
-
-      await commands["retry"]!.handler([], ctx);
-      await advance(3_000);
-
-      expect(agent.prompt.mock.calls.length).toBe(attemptsBeforeManual + 1);
+      // Three at-cap attempts (8000) are scheduled; the next one is vetoed.
+      expect(await (ext.prototype._prepareRetry as any).call(session, failure)).toBe(false);
     } finally {
-      restore();
+      ext.restore();
+    }
+  });
+
+  // Session isolation: resetting session A's counters must not resurrect
+  // session B's veto budget.
+  it("keeps sibling sessions' veto budgets isolated through /retry reset", async () => {
+    const ext = await loadExtension();
+    try {
+      const managerA = {};
+      const managerB = {};
+      const capConfig = {
+        baseDelayMs: 100,
+        maxDelayMs: 100,
+        multiplier: 2,
+        maxRetriesAtMaxDelay: 3,
+      };
+      const sessionA = createFakeSession({ manager: managerA });
+      const sessionB = createFakeSession({ manager: managerB });
+      registerManaged(managerA, ext.api as unknown as object, capConfig, true, false, sessionA.agent, sessionA);
+      registerManaged(managerB, ext.api as unknown as object, capConfig, true, false, sessionB.agent, sessionB);
+      const failure = errorMessage("Connection error");
+
+      for (let i = 0; i < 3; i++) {
+        expect(await prepare(ext, sessionA, failure)).toBe(true);
+      }
+      expect(await prepare(ext, sessionA, failure)).toBe(false);
+
+      const ctxB = { sessionManager: managerB, ui: { notify: vi.fn() } };
+      await ext.commands["retry"].handler("reset", ctxB);
+      expect(getRetrySession(managerA)!.retry.failuresAtCap.connection ?? 0).toBe(3);
+      expect(getRetrySession(managerB)!.retry.failuresAtCap.connection ?? 0).toBe(0);
+
+      // Session B still has its full budget after A's reset.
+      expect(await prepare(ext, sessionB, failure)).toBe(true);
+      // Session A remains capped.
+      expect(await prepare(ext, sessionA, failure)).toBe(false);
+    } finally {
+      ext.restore();
     }
   });
 });

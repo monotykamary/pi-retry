@@ -4,13 +4,9 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
-/** Stable status key used to replace the active retry countdown row. */
-export const RETRY_STATUS_KEY = "pi-retry-backoff";
-
 /**
  * Configuration for exponential backoff
- */
-export interface BackoffConfig {
+ */export interface BackoffConfig {
   baseDelayMs: number;
   maxDelayMs: number;
   multiplier: number;
@@ -42,17 +38,6 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   const seconds = ((ms % 60000) / 1000).toFixed(0);
   return `${minutes}m ${seconds}s`;
-}
-
-/**
- * Format the single status-bar line used while a retry backoff is active.
- *
- * @param attempt Ordinary retry attempt number shown to the user.
- * @param remainingMs Milliseconds remaining before the hidden retry turn.
- * @returns Stable status text whose changing duration can replace one UI row.
- */
-export function formatRetryCountdown(attempt: number, remainingMs: number): string {
-  return `Retry attempt ${attempt} - retrying in ${formatDuration(Math.max(0, remainingMs))}`;
 }
 
 /**
@@ -108,48 +93,5 @@ export class RetryState {
     this.attempt = 0;
     this.isRetrying = false;
     this.lastErrorMessage = "";
-  }
-}
-
-/**
- * State manager for tracking max_tokens continuations.
- *
- * Unlike RetryState (which caps nothing but counts retries), continuations are
- * also uncapped — each one produces valid output and the model naturally
- * terminates when done, so there is no reason to impose a limit.
- */
-export class ContinuationState {
-  private count = 0;
-  private isContinuing = false;
-
-  getCount(): number {
-    return this.count;
-  }
-
-  getIsContinuing(): boolean {
-    return this.isContinuing;
-  }
-
-  startContinuation(): void {
-    this.isContinuing = true;
-    this.count++;
-  }
-
-  endContinuation(): void {
-    this.isContinuing = false;
-  }
-
-  /**
-   * Called when a turn completes without hitting max_tokens.
-   * Resets the counter since the model finished normally.
-   */
-  complete(): void {
-    this.count = 0;
-    this.isContinuing = false;
-  }
-
-  reset(): void {
-    this.count = 0;
-    this.isContinuing = false;
   }
 }

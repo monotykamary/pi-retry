@@ -6,10 +6,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   calculateDelay,
   formatDuration,
-  formatRetryCountdown,
   getLastAssistantMessage,
   RetryState,
-  ContinuationState,
   DEFAULT_BACKOFF_CONFIG,
   type BackoffConfig,
 } from '../../src/retry-logic.js';
@@ -71,14 +69,6 @@ describe('formatDuration', () => {
 
   it('handles edge cases', () => {
     expect(formatDuration(0)).toBe('0ms');
-  });
-});
-
-describe('formatRetryCountdown', () => {
-  it('keeps the attempt label stable while replacing the remaining duration', () => {
-    expect(formatRetryCountdown(2, 2500)).toBe('Retry attempt 2 - retrying in 2.5s');
-    expect(formatRetryCountdown(2, 0)).toBe('Retry attempt 2 - retrying in 0ms');
-    expect(formatRetryCountdown(2, -1)).toBe('Retry attempt 2 - retrying in 0ms');
   });
 });
 
@@ -189,60 +179,5 @@ describe('DEFAULT_BACKOFF_CONFIG', () => {
     expect(DEFAULT_BACKOFF_CONFIG.baseDelayMs).toBe(2000);
     expect(DEFAULT_BACKOFF_CONFIG.maxDelayMs).toBe(60000);
     expect(DEFAULT_BACKOFF_CONFIG.multiplier).toBe(2);
-  });
-});
-
-describe('ContinuationState', () => {
-  let state: ContinuationState;
-
-  beforeEach(() => {
-    state = new ContinuationState();
-  });
-
-  it('initializes with zero count', () => {
-    expect(state.getCount()).toBe(0);
-    expect(state.getIsContinuing()).toBe(false);
-  });
-
-  it('increments count on startContinuation', () => {
-    state.startContinuation();
-    expect(state.getCount()).toBe(1);
-    expect(state.getIsContinuing()).toBe(true);
-  });
-
-  it('sets isContinuing to false on endContinuation', () => {
-    state.startContinuation();
-    expect(state.getIsContinuing()).toBe(true);
-    state.endContinuation();
-    expect(state.getIsContinuing()).toBe(false);
-    // Count is preserved
-    expect(state.getCount()).toBe(1);
-  });
-
-  it('tracks multiple continuations', () => {
-    state.startContinuation();
-    state.endContinuation();
-    state.startContinuation();
-    state.endContinuation();
-    state.startContinuation();
-    state.endContinuation();
-    expect(state.getCount()).toBe(3);
-  });
-
-  it('resets all state on reset', () => {
-    state.startContinuation();
-    state.reset();
-    expect(state.getCount()).toBe(0);
-    expect(state.getIsContinuing()).toBe(false);
-  });
-
-  it('resets all state on complete', () => {
-    state.startContinuation();
-    state.endContinuation();
-    state.startContinuation();
-    expect(state.getCount()).toBe(2);
-    state.complete();
-    expect(state.getCount()).toBe(0);
-    expect(state.getIsContinuing()).toBe(false);
   });
 });

@@ -9,9 +9,6 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
-export const RETRY_TRIGGER_CUSTOM_TYPE = "pi-retry:retry";
-export const CONTINUATION_CUSTOM_TYPE = "pi-retry:continue";
-
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
 const ERROR_400_413_PATTERNS = [
@@ -324,47 +321,6 @@ export function getErrorCategory(errorMessage: string): '400-413' | 'credit' | '
   if (CONNECTION_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'connection';
   if (BUILTIN_HANDLED_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   return 'other';
-}
-
-// ── Max tokens (not an error — continuation) ──
-
-export function hasMaxTokensStop(message: AgentMessage): boolean {
-  if (!isAssistantMessage(message)) return false;
-  return message.stopReason === "length";
-}
-
-// ── Empty / think-only stop (not an error — continuation) ──
-
-function getContentBlocks(message: AgentMessage): unknown[] {
-  const content = (message as { content?: unknown }).content;
-  return Array.isArray(content) ? content : [];
-}
-
-/**
- * Returns true for an assistant message whose turn ended without any
- * USABLE output: stopReason "stop" with only empty content — zero blocks
- * (Anthropic's documented empty responses with end_turn) or only reasoning
- * blocks (a reasoning model spent its output budget on thinking and never
- * produced text/tool calls — pi#6963 / kimi-cli think-only class).
- *
- * "Usable" = a non-empty text block or a toolCall block. Thinking, images,
- * and blank text do not count. This deliberately mirrors Anthropic's
- * "Empty responses..." do not continue the loop on these, and does NOT
- * flag a legitimately text-only final answer.
- */
-export function hasEmptyStop(message: AgentMessage): boolean {
-  if (!isAssistantMessage(message)) return false;
-  if (message.stopReason !== "stop") return false;
-  const hasUsable = getContentBlocks(message).some((block) => {
-    if (!block || typeof block !== "object") return false;
-    const candidate = block as { type?: unknown; text?: unknown };
-    if (candidate.type === "toolCall") return true;
-    if (candidate.type === "text") {
-      return typeof candidate.text === "string" && candidate.text.trim().length > 0;
-    }
-    return false;
-  });
-  return !hasUsable;
 }
 
 // Re-export getLastAssistantMessage for convenience

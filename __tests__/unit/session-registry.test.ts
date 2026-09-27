@@ -1,11 +1,20 @@
 import { afterEach, describe, expect, it } from "vitest";
+import type { PiRetryConfig } from "../../src/config.js";
 import {
   getRetrySession,
   getSessionAgent,
   recordRetrySessionAgent,
   registerRetrySession,
+  resetRetryTracker,
   unregisterRetrySession,
 } from "../../src/session-registry.js";
+
+const config: PiRetryConfig = {
+  baseDelayMs: 2000,
+  maxDelayMs: 60000,
+  multiplier: 2,
+  maxRetriesAtMaxDelay: 3,
+};
 
 const registrations: Array<{ manager: object; owner: object }> = [];
 
@@ -42,8 +51,8 @@ describe("session registry ownership", () => {
     const duplicateOwner = {};
     const options = {
       isChild: true,
-      suppressNativeRetry: true,
-      childRetryEnabled: true,
+      managedRetry: true,
+      config,
     };
 
     const first = registerRetrySession(manager, owner, options);
@@ -62,18 +71,18 @@ describe("session registry ownership", () => {
   });
 
   // Session-manager WeakMap keys keep sibling main/child sessions isolated.
-  it("isolates ownership and Agent identity between sibling sessions", () => {
+  it("isolates ownership, identity, and policy between sibling sessions", () => {
     const first = createRegistration();
     const second = createRegistration();
     const firstOptions = {
       isChild: false,
-      suppressNativeRetry: true,
-      childRetryEnabled: false,
+      managedRetry: true,
+      config,
     };
     const secondOptions = {
       isChild: true,
-      suppressNativeRetry: true,
-      childRetryEnabled: true,
+      managedRetry: true,
+      config: { ...config, baseDelayMs: 500 },
     };
 
     const firstBinding = registerRetrySession(first.manager, first.owner, firstOptions);
@@ -82,7 +91,33 @@ describe("session registry ownership", () => {
     expect(firstBinding?.binding).not.toBe(secondBinding?.binding);
     expect(getRetrySession(first.manager)?.isChild).toBe(false);
     expect(getRetrySession(second.manager)?.isChild).toBe(true);
+    expect(getRetrySession(first.manager)?.config.baseDelayMs).toBe(2000);
+    expect(getRetrySession(second.manager)?.config.baseDelayMs).toBe(500);
     expect(getSessionAgent(first.manager)).toBe(first.agent);
     expect(getSessionAgent(second.manager)).toBe(second.agent);
+  });
+
+  // Resetting one session's tracker must not touch a sibling's counters.
+  it("resets the tracker of the bound session only", () => {
+    const first = createRegistration();
+    const second = createRegistration();
+    const options = { isChild: false, managedRetry: true, config };
+    const firstBinding = registerRetrySession(first.manager, first.owner, options)!.binding;
+    registerRetrySession(second.manager, second.owner, options);
+
+    resetRetryTracker(firstBinding);
+    expect(firstBinding.retry.failuresAtCap).toEqual({});
+    expect(getRetrySession(second.manager)?.retry.failuresAtCap).toEqual({});
+  });
+
+  // Disabled child policies stay unmanaged so the patches delegate to native.
+  it("keeps managedRetry false available for native-only sessions", () => {
+    const { manager, owner } = createRegistration();
+    const binding = registerRetrySession(manager, owner, {
+      isChild: true,
+      managedRetry: false,
+      config,
+    })!.binding;
+    expect(binding.managedRetry).toBe(false);
   });
 });
