@@ -15,6 +15,14 @@ _400/413, connection errors, credit errors, stream exhaustion — retry them all
 
 ---
 
+## Pi 0.99 compatibility (0.10.3)
+
+Tested with Pi **0.99.0**. Host-provided Pi packages and TypeBox are peers (`*`), not bundled runtime dependencies; development uses exact Pi 0.99.0 pins and host-compatible TypeBox where needed.
+
+Verified the actual `AgentSession.bindExtensions` and `_prepareRetry` lifecycle, including child retry ownership, cancellation and native nested tools. No replacement retry dispatcher is introduced.
+
+Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI99_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI99_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
+
 ## Overview
 
 This extension automatically detects and retries **all** errors by default, with only a tiny blacklist of known permanent failures (invalid API key, missing model, etc.).
