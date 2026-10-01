@@ -1,6 +1,6 @@
 {
   "name": "@monotykamary/pi-retry",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "description": "Extension suite for pi coding agent that handles 400/413 errors and connection errors with automatic retry",
   "type": "module",
   "author": "Tom X Nguyen",
@@ -33,7 +33,7 @@
     "README.md"
   ],
   "scripts": {
-    "test:host": "node scripts/pi99-host.mjs",
+    "test:host": "node scripts/pi1-host.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -47,10 +47,10 @@
     "@earendil-works/pi-ai": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.99.0",
-    "@earendil-works/pi-agent-core": "0.99.0",
-    "@earendil-works/pi-coding-agent": "0.99.0",
-    "@earendil-works/pi-tui": "0.99.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-agent-core": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
     "@types/node": "25.9.1",
     "@vitest/coverage-v8": "4.1.7",
     "knip": "6.14.1",
