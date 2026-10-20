@@ -585,7 +585,10 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Child-session retry takeover is disabled.", "info");
           return;
         }
-        const childSubcommand = args[0]?.toLowerCase();
+        // pi's RegisterCommand contract passes `args` as a string ("status",
+        // "reset", or "" for bare /retry), so read the first whitespace-delimited
+        // token — indexing args[0] yields the first character only.
+        const childSubcommand = args.trim().split(/\s+/)[0]?.toLowerCase();
         if (childSubcommand === "status") {
           ctx.ui.notify(
             `Child retry status:\n${JSON.stringify(controller.status(), null, 2)}`,
@@ -602,7 +605,8 @@ export default function (pi: ExtensionAPI) {
         await controller.retryManually(ctx);
         return;
       }
-      const subcommand = args[0]?.toLowerCase();
+      // Same string-vs-array contract as the child branch above.
+      const subcommand = args.trim().split(/\s+/)[0]?.toLowerCase();
 
       // /retry status - Show diagnostics
       if (subcommand === "status") {

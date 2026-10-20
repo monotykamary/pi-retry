@@ -212,7 +212,8 @@ describe("reported retry regressions", () => {
       await advance(250_000);
       const attemptsBeforeManual = agent.prompt.mock.calls.length;
 
-      await commands["retry"]!.handler([], ctx);
+      // pi passes command args as a string, not an array.
+      await commands["retry"]!.handler("", ctx);
       await advance(3_000);
 
       expect(agent.prompt.mock.calls.length).toBe(attemptsBeforeManual + 1);

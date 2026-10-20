@@ -745,7 +745,8 @@ describe("smoke: /retry command", () => {
       const entries = [errorEntry("Connection error")];
       const ctx = createMockCtx(entries);
 
-      await retryHandler!([], ctx);
+      // pi passes command args as a string, not an array.
+      await retryHandler!("", ctx);
       await advance(5000);
 
       expect(attempt).toBeGreaterThanOrEqual(1);
@@ -761,7 +762,7 @@ describe("smoke: /retry command", () => {
       expect(retryHandler).toBeDefined();
 
       const ctx = createMockCtx([]);
-      await retryHandler!(["reset"], ctx);
+      await retryHandler!("reset", ctx);
 
       expect(ctx.ui.notify).toHaveBeenCalledWith(
         expect.stringContaining("reset"),
