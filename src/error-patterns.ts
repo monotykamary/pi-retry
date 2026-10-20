@@ -188,7 +188,10 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
   /session\s*(limit|quota)/i,
   /exceeded your usage limit/i,
   // Billing / plan quotas (OpenAI insufficient_quota, Gemini RESOURCE_EXHAUSTED)
-  /insufficient[_\s]quota/i,
+  // Negative lookahead: Alibaba appends "(type=insufficient_quota ...)" to its TPM
+  // rate-limit error "Allocated quota exceeded" (transient, retryable — see the
+  // Alibaba note below). Exclude that form so it is not misread as a billing hard cap.
+  /^(?![\s\S]*allocated\s*quota\s*exceeded)[\s\S]*?insufficient[_\s]quota/i,
   /exceeded your current quota/i, // Kimi's "...current token quota" (balance, retryable) intentionally not matched
   // Hard allotments
   /free.models.per.day/i, // OpenRouter free-tier daily pool
@@ -207,6 +210,15 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
   /budget\s*(has\s*been\s*)?(exceeded|exhausted|limit)/i,
   /max(imum)?\s*budget\s*(exceeded|reached|limit)/i,
   /spending\s*limit/i,
+  // Gateway/proxy budget variants the generic rules above miss because the word
+  // order or separator differs. Evidence: a LiteLLM-style 400 "ExceededBudget:
+  // User=... over budget. Spend=..., Budget=..." with error.type "budget_exceeded"
+  // (budget is a camelCase suffix, and the underscore in budget_exceeded is not
+  // matched by the whitespace-only \s* in the generic rule). All are hard caps —
+  // retrying an over-budget account is pointless until top-up.
+  /exceeded\s*budget/i, // "ExceededBudget:" (budget as camelCase suffix)
+  /over\s*budget/i, // "... over budget. Spend=..., Budget=..."
+  /budget[\s_]exceeded/i, // "... type=budget_exceeded" (underscore variant)
   // Google subscription caps (Gemini Code Assist, Antigravity)
   /exhausted your capacity/i, // "You have exhausted your capacity on this model."
   /quota will reset after/i, // "Your quota will reset after 8h44m7s."
