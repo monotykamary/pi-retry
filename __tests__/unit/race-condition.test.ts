@@ -344,7 +344,8 @@ describe("triggerInvisibleContinue retry loop", () => {
       const entries = [errorEntry("Connection error")];
       const ctx = createMockCtx(entries);
 
-      await expect(retryHandler!([], ctx)).resolves.toBeUndefined();
+      // pi passes command args as a string, not an array.
+      await expect(retryHandler!("", ctx)).resolves.toBeUndefined();
 
       await advanceThroughRetry(3000);
     } finally {
