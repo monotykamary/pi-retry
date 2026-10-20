@@ -471,6 +471,18 @@ describe('hasQuotaExhaustedError', () => {
     expect(hasRetryableError(msg)).toBe(true);
   });
 
+  it('keeps Alibaba TPM rate limiting retryable when it carries insufficient_quota', () => {
+    // LiteLLM surfaces the 429 Throttling.AllocationQuota body with
+    // error.type=insufficient_quota appended, which used to match the generic
+    // billing-quota rule and hard-stopped the loop on a transient throttle.
+    const msg = createAssistantError(
+      'Allocated quota exceeded, please increase your quota limit (type=insufficient_quota)',
+    );
+    expect(hasQuotaExhaustedError(msg)).toBe(false);
+    expect(isNonRetryableError(msg)).toBe(false);
+    expect(hasRetryableError(msg)).toBe(true);
+  });
+
   it('detects Alibaba hard quota variants (Coding Plan windows / free quota)', () => {
     expect(hasQuotaExhaustedError(createAssistantError('hour allocated quota exceeded'))).toBe(true);
     expect(hasQuotaExhaustedError(createAssistantError('week allocated quota exceeded'))).toBe(true);
@@ -485,6 +497,19 @@ describe('hasQuotaExhaustedError', () => {
   it('detects budget exhaustion (LiteLLM-style proxies)', () => {
     expect(hasQuotaExhaustedError(createAssistantError('Budget has been exceeded! Current cost: 0.5, Max budget: 0.4'))).toBe(true);
     expect(hasQuotaExhaustedError(createAssistantError('out of budget'))).toBe(true);
+  });
+
+  it('detects gateway budget spellings the generic rules miss', () => {
+    // LiteLLM 400 in three shapes the generic rules do not cover: budget as a
+    // camelCase suffix, "over budget" instead of "out of budget", and an
+    // underscore-separated error.type.
+    const exceededBudget = createAssistantError(
+      'ExceededBudget: User=u over budget. Spend=1.2, Budget=1.0',
+    );
+    expect(hasQuotaExhaustedError(exceededBudget)).toBe(true);
+    expect(isNonRetryableError(exceededBudget)).toBe(true);
+    expect(hasRetryableError(exceededBudget)).toBe(false);
+    expect(hasQuotaExhaustedError(createAssistantError('litellm.BadRequestError ... type=budget_exceeded'))).toBe(true);
   });
 
   it('detects suspended accounts (Kimi exceeded_current_quota_error)', () => {
