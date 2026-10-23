@@ -6,6 +6,7 @@ import {
   registerRetrySession,
   removeErrorFromRetryContext,
   unregisterRetrySession,
+  waitForSessionIdle,
 } from "../../src/session-registry.js";
 
 const registrations: Array<{ manager: object; owner: object }> = [];
@@ -140,5 +141,101 @@ describe("session registry ownership", () => {
     expect(getRetrySession(second.manager)?.isChild).toBe(true);
     expect(getSessionAgent(first.manager)).toBe(first.agent);
     expect(getSessionAgent(second.manager)).toBe(second.agent);
+  });
+});
+
+describe("waitForSessionIdle", () => {
+  // TEST target: src/session-registry.ts[waitForSessionIdle]
+  // The session lifecycle is the barrier: the Agent may look idle while the
+  // session is still preparing the run it just started.
+  it("waits on the session lifecycle instead of the Agent when the session owns the agent", async () => {
+    const manager = {};
+    const calls: string[] = [];
+    const agent = {
+      waitForIdle: async () => {
+        calls.push("agent");
+      },
+    };
+    let releaseSession: (() => void) | undefined;
+    const session = {
+      sessionManager: manager,
+      agent,
+      waitForIdle: () => {
+        calls.push("session");
+        return new Promise<void>(resolve => {
+          releaseSession = resolve;
+        });
+      },
+    };
+    recordRetrySessionAgent(manager, agent as any, session as any);
+
+    let settled = false;
+    const waiting = waitForSessionIdle(manager, agent as any).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The Agent is already idle, yet the wait must stay pending on the session.
+    expect(settled).toBe(false);
+    expect(calls).toEqual(["session"]);
+
+    releaseSession?.();
+    await waiting;
+    expect(settled).toBe(true);
+    expect(calls).toEqual(["session"]);
+  });
+
+  // Fixtures and older mappings without a session-level wait keep working.
+  it("falls back to Agent.waitForIdle when the session has no waitForIdle", async () => {
+    const manager = {};
+    let agentWaits = 0;
+    const agent = {
+      waitForIdle: async () => {
+        agentWaits++;
+      },
+    };
+    recordRetrySessionAgent(manager, agent as any);
+
+    await waitForSessionIdle(manager, agent as any);
+    expect(agentWaits).toBe(1);
+  });
+
+  // A session that now owns a different Agent must not gate an old loop.
+  it("ignores the session when it owns a different Agent", async () => {
+    const manager = {};
+    let sessionWaits = 0;
+    let agentWaits = 0;
+    const ownedAgent = { waitForIdle: async () => {} };
+    const staleAgent = {
+      waitForIdle: async () => {
+        agentWaits++;
+      },
+    };
+    const session = {
+      sessionManager: manager,
+      agent: ownedAgent,
+      waitForIdle: async () => {
+        sessionWaits++;
+      },
+    };
+    recordRetrySessionAgent(manager, ownedAgent as any, session as any);
+
+    await waitForSessionIdle(manager, staleAgent as any);
+    expect(sessionWaits).toBe(0);
+    expect(agentWaits).toBe(1);
+  });
+
+  // An unmapped or missing manager degrades to the plain Agent barrier.
+  it("falls back to Agent.waitForIdle for an unmapped session manager", async () => {
+    let agentWaits = 0;
+    const agent = {
+      waitForIdle: async () => {
+        agentWaits++;
+      },
+    };
+
+    await waitForSessionIdle({}, agent as any);
+    await waitForSessionIdle(undefined, agent as any);
+    expect(agentWaits).toBe(2);
   });
 });

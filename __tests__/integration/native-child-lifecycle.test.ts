@@ -407,6 +407,7 @@ describe("native child retry lifecycle", () => {
       }
     }
   });
+
   // User-configured OR rules, arbitrary markers, and flags select inline recovery.
   it("selects inline recovery from an arbitrary configured system prompt rule", async () => {
     const harness = await createChildHarness(
