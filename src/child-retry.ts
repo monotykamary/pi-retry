@@ -16,10 +16,12 @@ import {
   isAssistantMessage,
   isContextOverflowError,
   isNonRetryableError,
+  isPermanentError,
   isSilencedError,
   RETRY_TRIGGER_CUSTOM_TYPE,
 } from "./error-patterns.js";
 import {
+  appendRetryInstructions,
   calculateDelay,
   ContinuationState,
   formatRetryCountdown,
@@ -31,6 +33,16 @@ import { removeErrorFromRetryContext } from "./session-registry.js";
 
 /** The hidden turn kinds that can continue an owned child prompt. */
 export type ChildHiddenTurnKind = "retry" | "continue" | "empty";
+
+/** Options used only for an explicitly requested child retry. */
+interface ChildManualRetryOptions {
+  /** Override the first backoff when a separate timer has already elapsed. */
+  initialDelayMs?: number;
+  /** Permit one explicit attempt after a quota or usage-limit error. */
+  allowQuota?: boolean;
+  /** Optional instructions to include in the first hidden retry. */
+  additionalPrompt?: string;
+}
 
 /** Retry state grouped by the category shown in child diagnostics. */
 export interface ChildRetryStatus {
@@ -119,10 +131,17 @@ export class ChildRetryController {
    * Inspect one awaited child agent_end event and schedule its next turn.
    *
    * @param ctx SDK context carrying the current abort signal and diagnostics UI.
-   * @param manual True for `/retry`, which runs outside an agent run.
+   * @param manual True for a manual retry, which runs outside an agent run.
+   * @param options Optional first-delay, quota and instruction overrides for an explicit retry.
    * @returns A promise that settles after one backoff and queue operation.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[inline retry]
    */
-  public async handleAgentEnd(ctx: ExtensionContext, manual = false): Promise<void> {
+  public async handleAgentEnd(
+    ctx: ExtensionContext,
+    manual = false,
+    options?: ChildManualRetryOptions,
+  ): Promise<void> {
     if (this.closed) return;
     if (ctx.signal?.aborted) {
       this.cancel("Agent operation aborted.");
@@ -150,7 +169,7 @@ export class ChildRetryController {
         `Max tokens reached - auto-continuing (continuation ${this.continuationState.getCount()})...`,
         "info",
       );
-      await this.schedule("continue", ctx);
+      await this.schedule("continue", ctx, manual, options?.initialDelayMs, options?.additionalPrompt);
       this.continuationState.endContinuation();
       return;
     }
@@ -167,13 +186,16 @@ export class ChildRetryController {
         return;
       }
       this.notify(ctx, "Empty response - nudging once...", "info");
-      await this.schedule("empty", ctx);
+      await this.schedule("empty", ctx, manual, options?.initialDelayMs, options?.additionalPrompt);
       return;
     }
 
-    // Re-evaluate permanent and quota errors for every attempt, including a
-    // provider that changes its error category after a transient failure.
-    if (isNonRetryableError(lastAssistant)) {
+    // A scheduled manual retry may try a quota error once after its reset
+    // window; later automatic attempts still enforce the normal blacklist.
+    const retryQuota = manual && options?.allowQuota === true &&
+      hasQuotaExhaustedError(lastAssistant) && !isPermanentError(lastAssistant);
+    // Re-evaluate permanent and quota errors for every automatic attempt.
+    if (isNonRetryableError(lastAssistant) && !retryQuota) {
       const errorMsg = lastAssistant.errorMessage || "Unknown error";
       if (!isSilencedError(lastAssistant)) {
         this.notify(
@@ -189,7 +211,7 @@ export class ChildRetryController {
       return;
     }
 
-    if (!hasRetryableError(lastAssistant)) return;
+    if (!hasRetryableError(lastAssistant) && !retryQuota) return;
 
     const errorMsg = lastAssistant.errorMessage || "Unknown error";
     const category = getErrorCategory(errorMsg);
@@ -197,7 +219,7 @@ export class ChildRetryController {
     if (state.getIsRetrying()) return;
     state.startRetry(errorMsg);
     try {
-      await this.schedule("retry", ctx, manual);
+      await this.schedule("retry", ctx, manual, options?.initialDelayMs, options?.additionalPrompt);
     } finally {
       state.endRetry();
     }
@@ -317,14 +339,22 @@ export class ChildRetryController {
    *
    * @param kind Type of hidden turn to queue.
    * @param ctx SDK context with the active run signal.
+   * @param manual Whether this schedule was explicitly requested.
+   * @param initialDelayMs Optional override for the first backoff.
+   * @param additionalPrompt Optional instructions for the first hidden turn.
+   * @returns A promise that settles after the schedule finishes.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[additional prompt]
    */
   private async schedule(
     kind: ChildHiddenTurnKind,
     ctx: ExtensionContext,
     manual = false,
+    initialDelayMs?: number,
+    additionalPrompt?: string,
   ): Promise<void> {
     if (this.closed || this.driving) return;
-    const scheduled = this.runSchedule(kind, ctx, manual);
+    const scheduled = this.runSchedule(kind, ctx, manual, initialDelayMs, additionalPrompt);
     this.activeSchedule = scheduled;
     try {
       await scheduled;
@@ -339,11 +369,18 @@ export class ChildRetryController {
    * @param kind Type of hidden turn to queue.
    * @param ctx SDK context with the active run signal.
    * @param manual True when no agent run is active to reach the settle boundary.
+   * @param initialDelayMs Optional override for the first backoff.
+   * @param additionalPrompt Optional instructions for the first hidden turn.
+   * @returns A promise that settles after the retry is queued or cancelled.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[additional prompt]
    */
   private async runSchedule(
     kind: ChildHiddenTurnKind,
     ctx: ExtensionContext,
     manual: boolean,
+    initialDelayMs?: number,
+    additionalPrompt?: string,
   ): Promise<void> {
     this.driving = true;
     const generation = this.generation;
@@ -371,7 +408,7 @@ export class ChildRetryController {
         return;
       }
       const attempt = kind === "retry" ? this.retryAttempt : this.retryAttempt + 1;
-      const delay = calculateDelay(attempt, this.config);
+      const delay = initialDelayMs ?? calculateDelay(attempt, this.config);
       if (kind === "retry" && delay >= this.config.maxDelayMs) {
         this.maxDelayRetries++;
       }
@@ -407,11 +444,14 @@ export class ChildRetryController {
           customType: kind === "retry"
             ? RETRY_TRIGGER_CUSTOM_TYPE
             : CONTINUATION_CUSTOM_TYPE,
-          content: kind === "retry"
-            ? "Retry the previous request."
-            : kind === "empty"
-              ? "Your previous turn contained only thinking and no answer or text. Continue now and produce the actual response, using tools if needed."
-              : "Continue exactly where you left off without repeating content.",
+          content: appendRetryInstructions(
+            kind === "retry"
+              ? "Retry the previous request."
+              : kind === "empty"
+                ? "Your previous turn contained only thinking and no answer or text. Continue now and produce the actual response, using tools if needed."
+                : "Continue exactly where you left off without repeating content.",
+            additionalPrompt,
+          ),
           display: false,
           details: undefined,
         },
@@ -435,17 +475,19 @@ export class ChildRetryController {
    * Start a manual retry as a new lifecycle, cancelling any automatic backoff first.
    *
    * @param ctx SDK context carrying the current error and abort signal.
+   * @param options Optional first-delay, quota and instruction overrides for an explicit retry.
    * @returns A promise that settles after the manual schedule has been queued.
    *
    * TEST:__tests__/unit/child-retry.test.ts[manual retry after cap, manual retry cancels active backoff]
+   * TEST:__tests__/unit/retry-after.test.ts[inline retry]
    */
-  public async retryManually(ctx: ExtensionContext): Promise<void> {
+  public async retryManually(ctx: ExtensionContext, options?: ChildManualRetryOptions): Promise<void> {
     if (this.closed) return;
     const activeSchedule = this.activeSchedule;
     this.reset();
     if (activeSchedule) await activeSchedule;
     if (this.closed) return;
-    await this.handleAgentEnd(ctx, true);
+    await this.handleAgentEnd(ctx, true, options);
   }
 
   /**

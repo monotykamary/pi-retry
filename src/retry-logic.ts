@@ -45,6 +45,39 @@ export function formatDuration(ms: number): string {
 }
 
 /**
+ * Parse a positive delay written with ordered day, hour, minute, and second units.
+ *
+ * @param input Duration such as `40m30s` or `1h 15m`.
+ * @returns Delay in milliseconds, or undefined for an invalid or unsafe duration.
+ *
+ * TEST:__tests__/unit/retry-after.test.ts[duration parsing]
+ */
+export function parseRetryDuration(input: string): number | undefined {
+  const match = /^\s*(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s\s*)?$/i.exec(input);
+  if (!match || !match.slice(1).some(Boolean)) return undefined;
+
+  // Reject unsafe arithmetic rather than silently scheduling an inaccurate delay.
+  const milliseconds = match.slice(1).reduce(
+    (total, value, index) => total + Number(value ?? 0) * [86_400_000, 3_600_000, 60_000, 1_000][index]!,
+    0,
+  );
+  return Number.isSafeInteger(milliseconds) && milliseconds > 0 ? milliseconds : undefined;
+}
+
+/**
+ * Add optional user instructions to the first hidden retry or continuation turn.
+ *
+ * @param message Default retry or continuation instruction.
+ * @param additionalPrompt Extra instructions supplied with `/retry-after`.
+ * @returns The provider-visible message, unchanged when no instructions were supplied.
+ *
+ * TEST:__tests__/unit/retry-after.test.ts[additional prompt]
+ */
+export function appendRetryInstructions(message: string, additionalPrompt?: string): string {
+  return additionalPrompt ? `${message}\n\nAdditional user instructions:\n${additionalPrompt}` : message;
+}
+
+/**
  * Format the single status-bar line used while a retry backoff is active.
  *
  * @param attempt Ordinary retry attempt number shown to the user.

@@ -1,0 +1,96 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  locked:
+    # Verify the declared dependency tree from the committed Bun lockfile.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          # Use a current Bun release so the repository's lockfile format is supported.
+          bun-version: latest
+
+      - name: Install locked dependencies
+        # Keep the baseline job reproducible; the compatibility matrix below is intentionally different.
+        run: bun install --frozen-lockfile
+
+      - name: Run tests
+        run: bun run test -- --reporter=dot
+
+      - name: Run type check
+        run: bun run typecheck
+
+      - name: Run dead-code check
+        run: bun run lint:dead
+
+  test:
+    # Exercise both the legacy live-state fallback and pi's canonical context projection.
+    # This compatibility matrix intentionally bypasses bun.lock to install each exact SDK version.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pre-0.87 SDK: no agent_before_settle boundary, so the extension uses the
+          # legacy live-state fallback. The source imports 0.87+ types, so tsc cannot
+          # pass here; the `locked` job already type-checks against the pinned SDK.
+          - sdk-version: "0.85.1"
+            companions: "@earendil-works/chord@0.85.1"
+            typecheck: false
+          # Pi 1.0: canonical context projection, but agent_settled has no `aborted` flag.
+          - sdk-version: "1.0.1"
+            companions: "@earendil-works/chord@1.0.1 @earendil-works/pi-codemode@1.0.1 @earendil-works/pi-mcp@1.0.1"
+            typecheck: true
+    # Keep the job name `test (<sdk-version>)`; the extra matrix keys would otherwise be appended to it.
+    name: test (${{ matrix.sdk-version }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+
+      - name: Update npm
+        # npm 10.9.3 (bundled with Node 22.19.0) crashes on this dependency tree with
+        # "Cannot read properties of null (reading 'edgesOut')"; npm 11 installs it.
+        run: npm install --global npm@11.6.2
+
+      - name: Install dependencies for the SDK matrix entry
+        # Without a lockfile, the SDK's own "^x.y.z" dependencies float to the newest
+        # release (for example pi-codemode 1.4.0 under pi-coding-agent 1.0.1), which
+        # breaks module imports. The companion packages are therefore pinned too.
+        run: >-
+          npm install --no-package-lock --ignore-scripts --no-save
+          @earendil-works/pi-ai@${{ matrix.sdk-version }}
+          @earendil-works/pi-agent-core@${{ matrix.sdk-version }}
+          @earendil-works/pi-coding-agent@${{ matrix.sdk-version }}
+          @earendil-works/pi-tui@${{ matrix.sdk-version }}
+          ${{ matrix.companions }}
+          @types/node@25.9.1
+          @vitest/coverage-v8@4.1.7
+          knip@6.14.1
+          typescript@6.0.3
+          vitest@4.1.7
+
+      - name: Run tests
+        run: npm test -- --reporter=dot
+
+      - name: Run type check
+        if: matrix.typecheck
+        run: npm run typecheck
+
+      - name: Run dead-code check
+        run: npm run lint:dead

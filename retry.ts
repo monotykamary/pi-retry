@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import type { Agent } from "@earendil-works/pi-agent-core";
 import {
@@ -7,6 +7,7 @@ import {
   hasConnectionError,
   hasRetryableError,
   isNonRetryableError,
+  isPermanentError,
   isSilencedError,
   hasQuotaExhaustedError,
   hasMaxTokensStop,
@@ -19,6 +20,8 @@ import {
   loadPiRetrySettings,
   formatDuration,
   formatRetryCountdown,
+  parseRetryDuration,
+  appendRetryInstructions,
   getErrorCategory,
   RETRY_STATUS_KEY,
   RetryState,
@@ -35,6 +38,7 @@ import {
   registerRetrySession,
   supportsSettleBoundary,
   unregisterRetrySession,
+  waitForSessionIdle,
 } from "./src/session-registry.js";
 
 const RETRY_STARTED_EVENT = "pi-retry:started";
@@ -209,7 +213,32 @@ function interruptibleSleep(
   });
 }
 
+/** Retry or continuation selected from the most recent assistant response. */
 type HiddenTurnKind = "retry" | "continue" | "empty";
+
+/** One session-local delayed manual retry and its cancellation resources. */
+interface ScheduledRetry {
+  /** Context belonging to the session that requested this retry. */
+  ctx: ExtensionContext;
+  /** Wall-clock time when the requested delay ends. */
+  deadline: number;
+  /** Optional user instructions to include in the first hidden retry. */
+  additionalPrompt?: string;
+  /** Next countdown tick, if the timer is still running. */
+  timer?: ReturnType<typeof setTimeout>;
+  /** Removes the Escape listener installed for this schedule. */
+  unsubscribe?: () => void;
+}
+
+/** Options reserved for a manual retry whose delay was already scheduled. */
+interface ManualRetryOptions {
+  /** Override the first backoff after an external wait. */
+  initialDelayMs?: number;
+  /** Permit one explicit retry of a quota or usage-limit failure. */
+  allowQuota?: boolean;
+  /** Optional user instructions to include in the first hidden retry. */
+  additionalPrompt?: string;
+}
 
 function getHiddenTurnKind(agent: Agent): HiddenTurnKind | null {
   const messages = agent.state.messages;
@@ -290,6 +319,12 @@ export default function (pi: ExtensionAPI) {
   let successGeneration = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
   const owner = pi as unknown as object;
+  // Keep timers session-local so a child or a replaced session cannot drive another one.
+  // TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle]
+  const scheduledRetries = new Map<object, ScheduledRetry>();
+  // A delayed retry must wait for its invalidated ordinary loop to release its mutex.
+  let activeContinueTask: Promise<void> | undefined;
+  let activeContinueManager: unknown;
   // Policy source of each inline controller, so a session reclassified between
   // session_start and before_agent_start never keeps the other policy.
   const controllerPolicies = new WeakMap<ChildRetryController, "subagents" | "main">();
@@ -404,18 +439,125 @@ export default function (pi: ExtensionAPI) {
    *
    * @param kind Hidden turn kind selected by the event or command.
    * @param ctx Session context whose manager identifies the Agent.
+   * @param initialDelayMs Optional first-delay override for a scheduled retry.
+   * @param additionalPrompt Optional instructions for the first hidden turn.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle, additional prompt]
    */
   function triggerForContext(
     kind: HiddenTurnKind,
     ctx: { sessionManager?: unknown },
+    initialDelayMs?: number,
+    additionalPrompt?: string,
   ): void {
     const sessionManager = ctx.sessionManager;
     const agent = getSessionAgent(sessionManager);
-    if (!agent) return;
-    void triggerInvisibleContinue(kind, agent, sessionManager);
+    if (!agent || _continueInProgress) return;
+    const task = triggerInvisibleContinue(kind, agent, sessionManager, initialDelayMs, additionalPrompt);
+    activeContinueTask = task;
+    activeContinueManager = sessionManager;
+    // A stale completion must not erase a newer loop's ownership handle.
+    const release = () => {
+      if (activeContinueTask === task) {
+        activeContinueTask = undefined;
+        activeContinueManager = undefined;
+      }
+    };
+    void task.then(release, release);
   }
 
-  pi.on("before_agent_start", (event, ctx) => {
+  /**
+   * Update the separate status row for a scheduled manual retry.
+   *
+   * @param scheduled Schedule whose session owns the row.
+   * @param text Status text, or undefined to clear it.
+   */
+  function setScheduledStatus(scheduled: ScheduledRetry, text: string | undefined): void {
+    try {
+      scheduled.ctx.ui.setStatus?.("pi-retry-scheduled", text);
+    } catch {
+      // A disposed UI must not prevent a timer from being cancelled or fired.
+    }
+  }
+
+  /**
+   * Remove a pending timer and its Escape listener for exactly one session.
+   *
+   * @param sessionManager Session identity whose schedule should be removed.
+   * @returns True when an existing schedule was cancelled.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle]
+   */
+  function cancelScheduledRetry(sessionManager: object): boolean {
+    const scheduled = scheduledRetries.get(sessionManager);
+    if (!scheduled) return false;
+    scheduledRetries.delete(sessionManager);
+    if (scheduled.timer !== undefined) clearTimeout(scheduled.timer);
+    scheduled.unsubscribe?.();
+    setScheduledStatus(scheduled, undefined);
+    return true;
+  }
+
+  /**
+   * Send a scheduled retry after any preceding run and retry loop have settled.
+   *
+   * @param sessionManager Identity of the session that owns the schedule.
+   * @param scheduled Schedule that must still own the session at each await.
+   * @returns A promise that settles after the retry is started or cancelled.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle, inline retry]
+   */
+  async function fireScheduledRetry(sessionManager: object, scheduled: ScheduledRetry): Promise<void> {
+    try {
+      // The previous loop may still be unwinding, or its current request may be
+      // in flight. Never start a competing loop or race the session's settle phase.
+      if (activeContinueManager === sessionManager && activeContinueTask) await activeContinueTask;
+      if (scheduledRetries.get(sessionManager) !== scheduled) return;
+      const agent = getSessionAgent(sessionManager);
+      if (!agent) {
+        cancelScheduledRetry(sessionManager);
+        scheduled.ctx.ui.notify("Cannot find the session to retry.", "warning");
+        return;
+      }
+      await waitForSessionIdle(sessionManager, agent);
+      if (scheduledRetries.get(sessionManager) !== scheduled) return;
+      cancelScheduledRetry(sessionManager);
+      await handleRetryCommand("", scheduled.ctx, {
+        initialDelayMs: 0,
+        allowQuota: true,
+        additionalPrompt: scheduled.additionalPrompt,
+      });
+    } catch {
+      if (scheduledRetries.get(sessionManager) === scheduled) {
+        cancelScheduledRetry(sessionManager);
+        scheduled.ctx.ui.notify("Could not start the scheduled retry.", "warning");
+      }
+    }
+  }
+
+  /**
+   * Refresh the countdown and fire once the requested deadline is reached.
+   *
+   * @param sessionManager Identity of the session that owns the schedule.
+   * @param scheduled Schedule whose deadline is being monitored.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle]
+   */
+  function tickScheduledRetry(sessionManager: object, scheduled: ScheduledRetry): void {
+    if (scheduledRetries.get(sessionManager) !== scheduled) return;
+    const remainingMs = scheduled.deadline - Date.now();
+    if (remainingMs <= 0) {
+      scheduled.timer = undefined;
+      setScheduledStatus(scheduled, "Scheduled retry - waiting for the session to become idle");
+      void fireScheduledRetry(sessionManager, scheduled);
+      return;
+    }
+    setScheduledStatus(scheduled, `Scheduled retry in ${formatDuration(remainingMs)}`);
+    // Short ticks avoid Node's maximum timeout limit and keep the status current.
+    scheduled.timer = setTimeout(() => tickScheduledRetry(sessionManager, scheduled), Math.min(remainingMs, 1_000));
+  }
+
+  pi.on("before_agent_start",  (event, ctx) => {
     configureSession(ctx, event.systemPrompt);
   });
 
@@ -429,6 +571,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("input", (_event, ctx) => {
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
+    // New input supersedes the old request, so its scheduled retry is no longer valid.
+    cancelScheduledRetry(ctx.sessionManager);
     if (binding?.isChild) {
       const controller = childControllerFor(ctx.sessionManager);
       controller?.handleInput();
@@ -444,11 +588,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", async (event, ctx) => {
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
+    const msg = event.message as any;
+    // An aborted or successful in-flight request no longer needs a scheduled retry.
+    if (ctx.signal?.aborted || (msg.role === "assistant" &&
+        (msg.stopReason === "aborted" || (msg.stopReason === "stop" && !hasEmptyStop(msg))))) {
+      cancelScheduledRetry(ctx.sessionManager);
+    }
     if (binding?.isChild) {
       childControllerFor(ctx.sessionManager)?.handleTurnEnd(event, ctx);
       return;
     }
-    const msg = event.message as any;
     if (
       ctx.signal?.aborted ||
       (msg.role === "assistant" && msg.stopReason === "aborted")
@@ -500,6 +649,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, ctx) => {
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
+    // A manually scheduled retry owns this request until its deadline or cancellation.
+    if (scheduledRetries.has(ctx.sessionManager)) {
+      if (ctx.signal?.aborted) cancelScheduledRetry(ctx.sessionManager);
+      return;
+    }
     if (binding?.isChild) {
       await childControllerFor(ctx.sessionManager)?.handleAgentEnd(ctx);
       return;
@@ -624,10 +778,97 @@ export default function (pi: ExtensionAPI) {
 
 
 
-  // Unified /retry command with subcommands
-  pi.registerCommand("retry", {
-    description: "Unified retry controls: /retry (manual trigger), /retry status (diagnostics), /retry reset (clear state)",
+  // A timed retry replaces automatic backoff rather than racing it.
+  // TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle]
+  pi.registerCommand("retry-after", {
+    description: "Retry after a duration with optional instructions; /retry-after cancel cancels it",
     handler: async (args, ctx) => {
+      const binding = getRetrySession(ctx.sessionManager);
+      if (binding && binding.owner !== owner) return;
+      const input = args.trim();
+      if (input.toLowerCase() === "cancel") {
+        ctx.ui.notify(
+          cancelScheduledRetry(ctx.sessionManager) ? "Scheduled retry cancelled." : "No scheduled retry to cancel.",
+          "info",
+        );
+        return;
+      }
+      // The first token is the duration; preserve the remaining text as user instructions.
+      const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(input);
+      const delay = parseRetryDuration(match?.[1] ?? "");
+      const additionalPrompt = match?.[2]?.trim() || undefined;
+      const deadline = Date.now() + (delay ?? 0);
+      if (delay === undefined || !Number.isSafeInteger(deadline)) {
+        ctx.ui.notify("Invalid duration. Use /retry-after 40m30s, 1h, or 30s.", "warning");
+        return;
+      }
+      const lastAssistant = getLastAssistantMessage(ctx.sessionManager.getEntries());
+      if (!lastAssistant || !isAssistantMessage(lastAssistant)) {
+        ctx.ui.notify("No assistant message found to retry", "warning");
+        return;
+      }
+      if (isContextOverflowError(lastAssistant)) {
+        ctx.ui.notify("Context overflow - use /compact before retrying.", "warning");
+        return;
+      }
+      if (isPermanentError(lastAssistant) || (!hasRetryableError(lastAssistant) &&
+          !hasQuotaExhaustedError(lastAssistant) && !hasMaxTokensStop(lastAssistant) && !hasEmptyStop(lastAssistant))) {
+        ctx.ui.notify("No retryable error detected. Fix permanent errors before retrying.", "warning");
+        return;
+      }
+      if (!getSessionAgent(ctx.sessionManager)) {
+        ctx.ui.notify("Cannot find the session to retry.", "warning");
+        return;
+      }
+      const controller = binding?.isChild ? childControllerFor(ctx.sessionManager) : undefined;
+      if (binding?.isChild && !controller) {
+        ctx.ui.notify("Child-session retry takeover is disabled.", "info");
+        return;
+      }
+
+      cancelScheduledRetry(ctx.sessionManager);
+      const scheduled: ScheduledRetry = { ctx, deadline, additionalPrompt };
+      scheduledRetries.set(ctx.sessionManager, scheduled);
+      if (controller) {
+        // Release an inline backoff without allowing it to send an early retry.
+        controller.reset();
+      } else {
+        // Invalidate and wake the detached loop; it will release its own mutex.
+        _inputGeneration++;
+        _wakeBackoffSleep?.();
+      }
+      if (ctx.mode === "tui" && typeof ctx.ui.onTerminalInput === "function") {
+        scheduled.unsubscribe = ctx.ui.onTerminalInput(data => {
+          if (matchesKey(data, "escape") && scheduledRetries.get(ctx.sessionManager) === scheduled) {
+            cancelScheduledRetry(ctx.sessionManager);
+            ctx.ui.notify("Scheduled retry cancelled.", "info");
+          }
+          // Pi still needs the key to handle its own active turn and queue.
+          return undefined;
+        });
+      }
+      tickScheduledRetry(ctx.sessionManager, scheduled);
+      ctx.ui.notify(`Retry scheduled in ${formatDuration(delay)}.`, "info");
+    },
+  });
+
+  /**
+   * Handle ordinary manual retry controls, including an elapsed scheduled retry.
+   *
+   * @param args Raw slash-command arguments (arrays are accepted by older test hosts).
+   * @param ctx Session context whose last assistant response is retried.
+   * @param options First-delay and quota overrides for a scheduled retry.
+   * @returns A promise that settles after the requested command is handled.
+   *
+   * TEST:__tests__/unit/user-retry-regression.test.ts[reported retry regressions]
+   * TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle, inline retry]
+   */
+  async function handleRetryCommand(
+    args: string | string[],
+    ctx: ExtensionContext,
+    options?: ManualRetryOptions,
+  ): Promise<void> {
+      const subcommand = (typeof args === "string" ? args.trim().split(/\s+/)[0] : args[0])?.toLowerCase();
       const binding = getRetrySession(ctx.sessionManager);
       if (binding && binding.owner !== owner) return;
       if (binding?.isChild) {
@@ -636,24 +877,24 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Child-session retry takeover is disabled.", "info");
           return;
         }
-        const childSubcommand = args[0]?.toLowerCase();
-        if (childSubcommand === "status") {
+        if (subcommand === "status") {
           ctx.ui.notify(
             `Child retry status:\n${JSON.stringify(controller.status(), null, 2)}`,
             "info",
           );
           return;
         }
-        if (childSubcommand === "reset") {
+        if (subcommand === "reset") {
+          cancelScheduledRetry(ctx.sessionManager);
           controller.reset();
           ctx.ui.notify("Child retry counters reset", "info");
           return;
         }
         // A manual child command starts a fresh lifecycle, even after automatic cap exhaustion.
-        await controller.retryManually(ctx);
+        cancelScheduledRetry(ctx.sessionManager);
+        await controller.retryManually(ctx, options);
         return;
       }
-      const subcommand = args[0]?.toLowerCase();
 
       // /retry status - Show diagnostics
       if (subcommand === "status") {
@@ -722,6 +963,7 @@ export default function (pi: ExtensionAPI) {
 
       // /retry reset - Reset all state
       if (subcommand === "reset") {
+        cancelScheduledRetry(ctx.sessionManager);
         state400.reset();
         stateCredit.reset();
         stateConnection.reset();
@@ -739,6 +981,11 @@ export default function (pi: ExtensionAPI) {
       // started (the mutex would drop it); cut the wait short so the existing
       // loop retries immediately.
       // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry skips the active backoff wait]
+      const cancelledSchedule = cancelScheduledRetry(ctx.sessionManager);
+      if (cancelledSchedule && activeContinueManager === ctx.sessionManager && activeContinueTask) {
+        // The cancelled schedule may still be waiting for the old loop to unwind.
+        await activeContinueTask;
+      }
       const liveLoop = skipLiveBackoff();
       if (liveLoop === "skipped") {
         ctx.ui.notify("Skipping the backoff wait - retrying now...", "info");
@@ -764,14 +1011,14 @@ export default function (pi: ExtensionAPI) {
       // Auto-detect: max_tokens continuation takes priority
       if (hasMaxTokensStop(lastAssistant)) {
         ctx.ui.notify("Manually continuing after max_tokens...", "info");
-        triggerForContext("continue", ctx);
+        triggerForContext("continue", ctx, options?.initialDelayMs, options?.additionalPrompt);
         return;
       }
 
       // Empty / think-only stop — nudge once
       if (hasEmptyStop(lastAssistant)) {
         ctx.ui.notify("Empty response — nudging once...", "info");
-        triggerForContext("empty", ctx);
+        triggerForContext("empty", ctx, options?.initialDelayMs, options?.additionalPrompt);
         return;
       }
 
@@ -789,6 +1036,13 @@ export default function (pi: ExtensionAPI) {
       // Non-retryable errors (permanent failures + quota/budget
       // exhaustion): report clearly instead of the generic fallback.
       if (isNonRetryableError(lastAssistant)) {
+        if (options?.allowQuota && hasQuotaExhaustedError(lastAssistant) && !isPermanentError(lastAssistant)) {
+          // The user explicitly waited for a possible reset; attempt it once.
+          ctx.ui.notify("Retrying after the scheduled quota reset wait...", "info");
+          stateOther.reset();
+          triggerForContext("retry", ctx, options.initialDelayMs, options.additionalPrompt);
+          return;
+        }
         const errorMsg = lastAssistant.errorMessage || "Unknown error";
         ctx.ui.notify(
           hasQuotaExhaustedError(lastAssistant)
@@ -803,21 +1057,21 @@ export default function (pi: ExtensionAPI) {
       if (has400or413Error(lastAssistant)) {
         ctx.ui.notify("Manually retrying 400/413 error...", "info");
         state400.reset();
-        triggerForContext("retry", ctx);
+        triggerForContext("retry", ctx, options?.initialDelayMs, options?.additionalPrompt);
         return;
       }
 
       if (hasCreditError(lastAssistant)) {
         ctx.ui.notify("Manually retrying credit error...", "info");
         stateCredit.reset();
-        triggerForContext("retry", ctx);
+        triggerForContext("retry", ctx, options?.initialDelayMs, options?.additionalPrompt);
         return;
       }
 
       if (hasConnectionError(lastAssistant)) {
         ctx.ui.notify("Manually retrying connection error...", "info");
         stateConnection.reset();
-        triggerForContext("retry", ctx);
+        triggerForContext("retry", ctx, options?.initialDelayMs, options?.additionalPrompt);
         return;
       }
 
@@ -825,13 +1079,18 @@ export default function (pi: ExtensionAPI) {
       if (hasRetryableError(lastAssistant)) {
         ctx.ui.notify("Manually retrying error...", "info");
         stateOther.reset();
-        triggerForContext("retry", ctx);
+        triggerForContext("retry", ctx, options?.initialDelayMs, options?.additionalPrompt);
         return;
       }
 
       // No error detected - show status instead
       ctx.ui.notify("No retryable error detected. Use '/retry status' for diagnostics.", "warning");
-    }
+  }
+
+  // Unified /retry command with subcommands.
+  pi.registerCommand("retry", {
+    description: "Unified retry controls: /retry (manual trigger), /retry status (diagnostics), /retry reset (clear state)",
+    handler: (args, ctx) => handleRetryCommand(args, ctx),
   });
 
   // Handle session replacement before Pi invalidates this extension runtime.
@@ -841,6 +1100,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", (_event, ctx) => {
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
+    cancelScheduledRetry(ctx.sessionManager);
     if (binding?.isChild) {
       childControllerFor(ctx.sessionManager)?.close();
       unregisterRetrySession(ctx.sessionManager, owner);
@@ -864,6 +1124,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const binding = configureSession(ctx);
     if (binding && binding.owner !== owner) return;
+    cancelScheduledRetry(ctx.sessionManager);
     if (binding?.isChild) return;
 
     // Bump the generation counter so any in-flight retry loop from a
@@ -931,11 +1192,18 @@ export default function (pi: ExtensionAPI) {
    * @param initialKind Hidden turn kind selected by the event or command.
    * @param myAgent Agent bound to the triggering session.
    * @param sessionManager Stable session-manager identity used by the registry.
+   * @param initialDelayMs Optional first-delay override after a scheduled wait.
+   * @param additionalPrompt Optional instructions for the first hidden turn.
+   * @returns A promise that settles when the retry lifecycle finishes.
+   *
+   * TEST:__tests__/unit/retry-after.test.ts[scheduled retry lifecycle, quota retry, additional prompt]
    */
   async function triggerInvisibleContinue(
     initialKind: HiddenTurnKind,
     myAgent: Agent,
     sessionManager: unknown,
+    initialDelayMs?: number,
+    additionalPrompt?: string,
   ) {
     // Keep the Agent that started this loop. Session replacement is handled by
     // the ordinary generation and exact session-manager ownership checks.
@@ -960,9 +1228,12 @@ export default function (pi: ExtensionAPI) {
     try {
       emitRetryLifecycleEvent(RETRY_STARTED_EVENT, retryLifecycleId);
 
-      // Wait for the current run to finish (activeRun resolves in
-      // finishRun() after agent_end listeners return).
-      await myAgent.waitForIdle();
+      // Wait for the whole session lifecycle, not just the low-level run. The
+      // Agent run resolves once agent_end listeners return, but AgentSession
+      // then emits agent_settled. A hidden message sent while that event is
+      // still being emitted is deferred, so the wait after the send would
+      // return at once and the backoff would restart from attempt 0.
+      await waitForSessionIdle(sessionManager, myAgent);
 
       // AgentSession clears its outer lifecycle immediately after Agent's
       // active run resolves. Yield to the next macrotask so the detached path
@@ -1034,7 +1305,9 @@ export default function (pi: ExtensionAPI) {
         const delayAttempt = hiddenTurnKind === "retry"
           ? ++retryAttempt
           : Math.max(1, retryAttempt + 1);
-        const delay = calculateDelay(delayAttempt, retryConfig);
+        // Only the first attempt skips backoff: the requested delay has already elapsed.
+        const delay = initialDelayMs ?? calculateDelay(delayAttempt, retryConfig);
+        initialDelayMs = undefined;
         const isMaxDelay = delay >= retryConfig.maxDelayMs;
         if (hiddenTurnKind === "retry" && isMaxDelay) {
           maxDelayRetries++;
@@ -1061,22 +1334,30 @@ export default function (pi: ExtensionAPI) {
               customType: hiddenTurnKind === "retry"
                 ? RETRY_TRIGGER_CUSTOM_TYPE
                 : CONTINUATION_CUSTOM_TYPE,
-              content: hiddenTurnKind === "retry"
-                ? "Retry the previous request."
-                : hiddenTurnKind === "empty"
-                  ? "Your previous turn contained only thinking and no answer or text. Continue now and produce the actual response, using tools if needed."
-                  : "Continue exactly where you left off without repeating content.",
+              content: appendRetryInstructions(
+                hiddenTurnKind === "retry"
+                  ? "Retry the previous request."
+                  : hiddenTurnKind === "empty"
+                    ? "Your previous turn contained only thinking and no answer or text. Continue now and produce the actual response, using tools if needed."
+                    : "Continue exactly where you left off without repeating content.",
+                additionalPrompt,
+              ),
               display: false,
               details: undefined,
             },
             { triggerTurn: true, deliverAs: "followUp" },
           );
+          // The instruction is part of the first hidden turn, not every later retry.
+          additionalPrompt = undefined;
 
-          // sendMessage is fire-and-forget, but AgentSession publishes the
-          // low-level run synchronously before returning. Waiting on Agent
-          // keeps this retry loop intact without bypassing session state.
+          // sendMessage is fire-and-forget. AgentSession marks itself busy
+          // synchronously, but the low-level Agent run only appears after
+          // _prepareRun() finishes, so Agent.waitForIdle() can return before the
+          // hidden turn starts. That made the loop read the stale tool result,
+          // treat the retry as complete, and restart backoff from attempt 0.
+          // Wait on the session lifecycle instead (falls back to Agent).
           await Promise.resolve();
-          await myAgent.waitForIdle();
+          await waitForSessionIdle(sessionManager, myAgent);
         } catch {
           return;
         }
@@ -1094,6 +1375,15 @@ export default function (pi: ExtensionAPI) {
         hiddenTurnKind = getHiddenTurnKind(myAgent);
         if (!hiddenTurnKind) {
           didRetryComplete = true;
+          return;
+        }
+        const lastMessage = myAgent.state.messages[myAgent.state.messages.length - 1];
+        if (hiddenTurnKind === "retry" && lastMessage &&
+            (isNonRetryableError(lastMessage) || isContextOverflowError(lastMessage))) {
+          // An explicit quota retry is only one attempt; never loop on a hard stop.
+          if (!isSilencedError(lastMessage)) {
+            notifySafely("Non-retryable error after retry - stopping.", "warning");
+          }
           return;
         }
 

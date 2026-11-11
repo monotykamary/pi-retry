@@ -1,17 +1,17 @@
 {
-  "name": "@monotykamary/pi-retry",
-  "version": "0.11.4",
+  "name": "@mithyer/pi-retry-plus",
+  "version": "0.11.4-1",
   "description": "Extension suite for pi coding agent that handles 400/413 errors and connection errors with automatic retry",
   "type": "module",
-  "author": "Tom X Nguyen",
+  "author": "mithyer",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/monotykamary/pi-retry.git"
+    "url": "git+https://github.com/mithyer/pi-retry-plus.git"
   },
-  "homepage": "https://github.com/monotykamary/pi-retry#readme",
+  "homepage": "https://github.com/mithyer/pi-retry-plus#readme",
   "bugs": {
-    "url": "https://github.com/monotykamary/pi-retry/issues"
+    "url": "https://github.com/mithyer/pi-retry-plus/issues"
   },
   "keywords": [
     "pi-package",

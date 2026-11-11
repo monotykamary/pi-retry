@@ -75,7 +75,7 @@ This extension provides automatic retry for all errors with configurable exponen
 Install directly from GitHub as a pi package:
 
 ```bash
-pi install https://github.com/monotykamary/pi-retry
+pi install https://github.com/mithyer/pi-retry
 ```
 
 Or add to your `settings.json`:
@@ -83,7 +83,7 @@ Or add to your `settings.json`:
 ```json
 {
   "packages": [
-    "https://github.com/monotykamary/pi-retry"
+    "https://github.com/mithyer/pi-retry"
   ]
 }
 ```
@@ -122,8 +122,14 @@ Once loaded, the extension **automatically** detects and retries all errors.
 | Command | Description |
 |---------|-------------|
 | `/retry` | Manually trigger immediate retry (auto-detects: 400/413, credit, connection, max_tokens, or any other error). If an automatic retry is currently sleeping in backoff, `/retry` cuts that wait short and sends the retry right away instead of queueing a second loop. |
+| `/retry-after 40m30s [instructions]` | Replace any active automatic backoff and retry after the specified duration, optionally adding instructions for the agent. |
+| `/retry-after cancel` | Cancel the scheduled retry without sending it. |
 | `/retry status` | Show current retry diagnostics for all error types + continuation state |
-| `/retry reset` | Reset all retry counters and state |
+| `/retry reset` | Reset all retry counters and state; also cancel any scheduled retry. |
+
+`/retry-after` accepts whole days, hours, minutes, and seconds in that order, such as `1h`, `30s`, `1h15m`, or `1d2h3m4s`. Write the duration without spaces; anything after it is optional additional context for the agent, for example `/retry-after 40m30s Please use the updated API documentation`. Those instructions are included in the first hidden retry or continuation turn. The duration must be positive. The countdown appears in the status bar; another `/retry-after` replaces it, while `/retry`, Escape, new input, or closing the session cancels it. The timer only lasts while the session is running.
+
+For quota or usage-limit errors, a scheduled retry explicitly makes **one** attempt after the wait, which is useful after a reset window. If the quota is still exhausted, retries stop again. Permanent errors and context overflow still need to be fixed before retrying.
 
 ---
 

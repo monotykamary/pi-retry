@@ -277,15 +277,29 @@ export function hasRetryableError(message: AgentMessage): boolean {
 }
 
 /**
- * Returns true only for known permanent failures (invalid API key, missing model, etc.)
+ * Identify permanent failures independently from potentially resetting quotas.
+ *
+ * @param message Assistant message to classify.
+ * @returns True when the message matches a permanent failure pattern.
+ *
+ * TEST:__tests__/unit/retry-after.test.ts[quota retry]
  */
-export function isNonRetryableError(message: AgentMessage): boolean {
+export function isPermanentError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
-  return (
-    NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!)) ||
-    QUOTA_EXHAUSTED_PATTERNS.some(p => p.test(message.errorMessage!))
-  );
+  return NON_RETRYABLE_PATTERNS.some(p => p.test(message.errorMessage!));
+}
+
+/**
+ * Identify errors that automatic retries must not repeat.
+ *
+ * @param message Assistant message to classify.
+ * @returns True for permanent failures or exhausted quotas.
+ *
+ * TEST:__tests__/unit/error-patterns.test.ts[isNonRetryableError]
+ */
+export function isNonRetryableError(message: AgentMessage): boolean {
+  return isPermanentError(message) || hasQuotaExhaustedError(message);
 }
 
 /**

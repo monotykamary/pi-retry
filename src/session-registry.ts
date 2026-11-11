@@ -17,6 +17,8 @@ type AgentSessionLike = {
   _prepareRetry?: (message: unknown) => Promise<boolean>;
   /** Canonical context omission hook introduced by pi 0.87. */
   _omitRecoveryAttempt?: (message: unknown) => void;
+  /** Resolves once the whole session lifecycle (not just the Agent run) is idle. */
+  waitForIdle?: () => Promise<void>;
 };
 
 /** The SDK identity captured before an extension registers its own policy. */
@@ -160,6 +162,43 @@ export function supportsSettleBoundary(): boolean {
 export function getSessionAgent(sessionManager: unknown): Agent | undefined {
   if (!sessionManager || typeof sessionManager !== "object") return undefined;
   return sharedRegistry().records.get(sessionManager)?.agent;
+}
+
+/**
+ * Wait until a session has finished its current run, including the work that
+ * follows it.
+ *
+ * `Agent.waitForIdle()` only covers the low-level run. That run is published
+ * after `AgentSession._prepareRun()` completes, so right after
+ * `pi.sendMessage()` the Agent can still look idle, and a retry loop that waits
+ * on it moves on before the hidden turn even starts and loses its backoff
+ * state. The same wrapper also emits `agent_settled` after the run, and a
+ * message sent during that emission is deferred until it ends. The session's
+ * `waitForIdle()` is flagged busy synchronously by a send, covers the settle
+ * phase and compaction, and also settles when the run fails to start, so it is
+ * the correct barrier before and after a hidden retry send.
+ *
+ * TEST:__tests__/unit/session-registry.test.ts[waitForSessionIdle]
+ * TEST:__tests__/integration/detached-backoff.test.ts[detached retry loop backoff]
+ *
+ * @param sessionManager Session manager object from ExtensionContext.
+ * @param agent Agent the caller is driving; used as the fallback barrier.
+ * @returns Resolves when the session (or, without a mapped session, the Agent) is idle.
+ */
+export async function waitForSessionIdle(
+  sessionManager: unknown,
+  agent: Agent,
+): Promise<void> {
+  const record = sessionManager && typeof sessionManager === "object"
+    ? sharedRegistry().records.get(sessionManager)
+    : undefined;
+  // Only trust the session when it still owns this exact Agent; a replaced
+  // session must not make an old loop wait on a different lifecycle.
+  if (record && record.agent === agent && typeof record.session.waitForIdle === "function") {
+    await record.session.waitForIdle();
+    return;
+  }
+  await agent.waitForIdle();
 }
 
 /**

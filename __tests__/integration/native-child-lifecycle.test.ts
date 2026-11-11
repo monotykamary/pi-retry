@@ -30,8 +30,25 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import retryExtension from "../../retry.ts";
+import { supportsSettleBoundary } from "../../src/session-registry.ts";
+import { sdkAtLeast } from "../helpers/sdk-version.ts";
 
 const temporaryRoots: string[] = [];
+
+/**
+ * Message-free retries need the SDK's `agent_before_settle` boundary (Pi 0.87+).
+ * On older SDKs the extension falls back to hidden retry messages, so tests of
+ * the message-free path itself are skipped there instead of failing.
+ */
+const itWithSettleBoundary = it.skipIf(!supportsSettleBoundary());
+
+/**
+ * Pi 1.1.0 changed two SDK behaviors that these tests observe: its native
+ * scheduler recognizes more transient provider errors ("server_busy", ...), and
+ * `agent_settled` carries an `aborted` flag. Older SDKs lack both, so the
+ * affected assertions run only on 1.1.0 or newer.
+ */
+const sdkIsPi11OrNewer = sdkAtLeast("1.1.0");
 
 // Remove all temporary model/settings trees even when a test fails.
 afterEach(() => {
@@ -377,7 +394,8 @@ describe("native child retry lifecycle", () => {
     }
   });
 
-  it.each([
+  // Pi 1.1's native classifier decides which of these errors the SDK retries.
+  (sdkIsPi11OrNewer ? it : it.skip).each([
     "server_busy",
     "servers are currently busy",
     "Selected model is at capacity",
@@ -407,6 +425,7 @@ describe("native child retry lifecycle", () => {
       }
     }
   });
+
   // User-configured OR rules, arbitrary markers, and flags select inline recovery.
   it("selects inline recovery from an arbitrary configured system prompt rule", async () => {
     const harness = await createChildHarness(
@@ -811,7 +830,7 @@ describe("message-free retries", () => {
   const roles = (context: Context | undefined) => context?.messages.map(message => message.role);
 
   // TEST:__tests__/integration/native-child-lifecycle.test.ts[message-free retries]
-  it("retries a child error with the identical context and no injected message", async () => {
+  itWithSettleBoundary("retries a child error with the identical context and no injected message", async () => {
     const contexts: Context[] = [];
     const harness = await createChildHarness(
       [
@@ -867,7 +886,7 @@ describe("message-free retries", () => {
   });
 
   // An opted-in ordinary session uses the inline controller in any mode.
-  it("keeps an opted-in ordinary prompt pending through recovery", async () => {
+  itWithSettleBoundary("keeps an opted-in ordinary prompt pending through recovery", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("ordinary failed", {
@@ -896,7 +915,7 @@ describe("message-free retries", () => {
     }
   });
 
-  it("preserves a completed tool result through a message-free retry", async () => {
+  itWithSettleBoundary("preserves a completed tool result through a message-free retry", async () => {
     let toolExecutionCount = 0;
     const countedTool = defineTool({
       name: "counted_tool",
@@ -950,7 +969,7 @@ describe("message-free retries", () => {
     }
   });
 
-  it("stops message-free retries at the configured cap", async () => {
+  itWithSettleBoundary("stops message-free retries at the configured cap", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("error one", { stopReason: "error", errorMessage: "connection error one" }),
@@ -974,7 +993,7 @@ describe("message-free retries", () => {
     }
   });
 
-  it("sends no request when abort interrupts a message-free backoff", async () => {
+  itWithSettleBoundary("sends no request when abort interrupts a message-free backoff", async () => {
     const harness = await createChildHarness(
       [
         fauxAssistantMessage("backoff error", {
@@ -1304,7 +1323,8 @@ describe("native child retry risk coverage", () => {
       await new Promise(resolve => setTimeout(resolve, 300));
       expect(harness.faux.state.callCount).toBe(1);
       expect(settledEvents).toHaveLength(1);
-      expect(settledEvents[0]?.aborted).toBe(true);
+      // Only Pi 1.1+ reports the flag on agent_settled.
+      if (sdkIsPi11OrNewer) expect(settledEvents[0]?.aborted).toBe(true);
     } finally {
       await harness.close();
     }
