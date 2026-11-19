@@ -166,6 +166,20 @@ const SILENCED_PATTERNS = [
 // - LiteLLM:      "Budget has been exceeded! Current cost: …, Max budget: …"
 // - Kimi:         "Your account {org}<{ak}> is suspended, please check your
 //                 plan and billing details" (exceeded_current_quota_error)
+// - OpenAI:       Sign in with ChatGPT (the token-sharing OAuth app on the
+//                 `openai` provider) sends code
+//                 `subscription_sharing_usage_limit_exceeded` as an SSE error
+//                 event on a 200: "The ChatGPT user has reached their
+//                 Subscription Sharing usage limit. … after their usage limit
+//                 resets or use an API key instead." A ChatGPT Business
+//                 workspace cap is `subscription_sharing_workplace_individual_usage_limit_exceeded`.
+//                 Both reset on a plan window; only an API key bypasses them.
+//                 pi-ai already lists both as non-retryable
+//                 (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN in
+//                 dist/utils/retry.js), so nothing here may retry them either.
+//                 Deliberately NOT matched: `subscription_sharing_usage_unavailable`
+//                 and `subscription_sharing_user_unavailable`, which pi-ai
+//                 classifies as transient and retryable.
 // - z.ai GLM:     "Usage limit reached for 5 hour. Your limit will reset at
 //                 …" (5-hour window, matches usage-limit-reached above) and
 //                 429 code 1113 "Insufficient balance or no resource package.
@@ -187,6 +201,12 @@ export const QUOTA_EXHAUSTED_PATTERNS = [
   /limit\s*will\s*reset\s*at/i,
   /session\s*(limit|quota)/i,
   /exceeded your usage limit/i,
+  // Sign in with ChatGPT: the shared subscription allowance (and a Business
+  // workspace's per-user cap) resets on a plan window, so a retry only burns
+  // backoff. Scoped to the two `_usage_limit` codes; the sibling
+  // `subscription_sharing_usage_unavailable` / `subscription_sharing_user_unavailable`
+  // codes are transient and must stay retryable.
+  /subscription[\s_-]*sharing[\s_-]*(?:workplace[\s_-]*individual[\s_-]*)?usage[\s_-]*limit/i,
   // Billing / plan quotas (OpenAI insufficient_quota, Gemini RESOURCE_EXHAUSTED)
   /insufficient[_\s]quota/i,
   /exceeded your current quota/i, // Kimi's "...current token quota" (balance, retryable) intentionally not matched

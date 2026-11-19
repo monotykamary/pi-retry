@@ -491,6 +491,28 @@ describe('hasQuotaExhaustedError', () => {
     expect(hasQuotaExhaustedError(createAssistantError('Your account org-123<ak-xyz> is suspended, please check your plan and billing details'))).toBe(true);
   });
 
+  it('detects Sign in with ChatGPT subscription-sharing limits (openai provider)', () => {
+    // pi-ai surfaces the SSE error event on a 200 as this exact sentence.
+    expect(hasQuotaExhaustedError(createAssistantError(
+      'The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.',
+    ))).toBe(true);
+  });
+
+  it('detects both subscription-sharing limit codes', () => {
+    expect(hasQuotaExhaustedError(createAssistantError('subscription_sharing_usage_limit_exceeded'))).toBe(true);
+    expect(hasQuotaExhaustedError(createAssistantError('subscription_sharing_workplace_individual_usage_limit_exceeded'))).toBe(true);
+  });
+
+  it('keeps subscription-sharing transient codes retryable', () => {
+    // pi-ai's retryable list; a usage-limit match here would swallow real outages.
+    const unavailable = createAssistantError('subscription_sharing_usage_unavailable');
+    const userUnavailable = createAssistantError('subscription_sharing_user_unavailable');
+    expect(hasQuotaExhaustedError(unavailable)).toBe(false);
+    expect(hasRetryableError(unavailable)).toBe(true);
+    expect(hasQuotaExhaustedError(userUnavailable)).toBe(false);
+    expect(hasRetryableError(userUnavailable)).toBe(true);
+  });
+
   it('returns false for non-error messages', () => {
     const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
     expect(hasQuotaExhaustedError(msg)).toBe(false);
@@ -515,6 +537,7 @@ describe('quota errors are not retried', () => {
     expect(getErrorCategory("You've hit your limit · resets 4pm")).toBe('quota');
     expect(getErrorCategory('out of budget')).toBe('quota');
     expect(getErrorCategory('Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day')).toBe('quota');
+    expect(getErrorCategory('subscription_sharing_usage_limit_exceeded')).toBe('quota');
   });
 });
 
